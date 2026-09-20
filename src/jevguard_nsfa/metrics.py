@@ -70,9 +70,10 @@ def binary_metrics(labels: Sequence[int], predicted: Sequence[bool], probabiliti
     )
 
 
-def percentile(values: Sequence[float], q: float) -> float:
+def percentile(values: Sequence[float], q: float) -> float | None:
+    """Linear-interpolated percentile, or ``None`` when the sample is empty."""
     if not values:
-        return math.nan
+        return None
     if not 0.0 <= q <= 1.0:
         raise ValueError("q must be in [0, 1]")
     ordered = sorted(float(value) for value in values)
@@ -87,9 +88,14 @@ def percentile(values: Sequence[float], q: float) -> float:
     return ordered[lo] * (1.0 - weight) + ordered[hi] * weight
 
 
-def latency_summary(latencies_ms: Sequence[float]) -> dict[str, float]:
+def latency_summary(latencies_ms: Sequence[float]) -> dict[str, float | None]:
+    """Summarize per-request latencies; every field is ``None`` when nothing was measured.
+
+    An empty sample means the measurement is undefined rather than NaN: ``None``
+    serializes as JSON ``null`` and keeps ``json.dumps(..., allow_nan=False)`` valid.
+    """
     if not latencies_ms:
-        return {"mean": math.nan, "p50": math.nan, "p95": math.nan, "p99": math.nan, "min": math.nan, "max": math.nan}
+        return {"mean": None, "p50": None, "p95": None, "p99": None, "min": None, "max": None}
     values = [float(value) for value in latencies_ms]
     return {
         "mean": sum(values) / len(values),
@@ -115,10 +121,12 @@ def evaluate_guard_results(
     binary = binary_metrics(labels, guesses, probabilities)
 
     positives = [(row, result) for row, result in zip(rows, results, strict=True) if row.label == 1 and row.domains]
-    domain_accuracy = (
+    # With no positive rows the domain-level accuracy is undefined, not NaN, so the
+    # report stays strict-JSON serializable.
+    domain_accuracy: float | None = (
         sum(result.predicted_domain in row.domains for row, result in positives) / len(positives)
         if positives
-        else math.nan
+        else None
     )
 
     domains = sorted({domain for row in rows for domain in row.domains})

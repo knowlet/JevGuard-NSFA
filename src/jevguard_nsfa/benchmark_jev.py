@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -18,6 +20,21 @@ from .models import GuardResult, ThresholdPolicy
 
 DEFAULT_DATASET = "inclusionAI/NSFA_Benchmarks"
 DEFAULT_JEV_INPUT_USD_PER_MILLION = 0.042
+
+
+def _sha256_lines(lines: Iterable[str]) -> str:
+    """SHA-256 hex digest of ``"\n".join(lines)`` encoded as UTF-8."""
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _rows_fingerprint(rows: Sequence[BenchmarkRow]) -> str:
+    """Identify the attempted sample selection in emitted order."""
+    return _sha256_lines(f"{row.id}|{row.label}|{row.side.value}|{row.lang}" for row in rows)
+
+
+def _rows_id_digest(rows: Sequence[BenchmarkRow]) -> str:
+    """Identify the row ids of a sample subset in emitted order."""
+    return _sha256_lines(row.id for row in rows)
 
 
 class RequestStartLimiter:
@@ -138,6 +155,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "languages": sorted(languages) if languages else None,
             "id_contains": args.id_contains,
             "seed": args.seed,
+            "fingerprint": _rows_fingerprint(rows),
         },
         "parameters": {
             "threshold": args.threshold,
@@ -153,7 +171,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "attempted": len(rows),
             "successful": len(results),
             "failed": len(failures),
+            "attempted_ids_sha256": _rows_id_digest(rows),
+            "successful_ids_sha256": _rows_id_digest(successful_rows),
         },
+        # Jev latency_ms is managed-API end-to-end latency for a single request.
+        "latency_scope": "request",
         "quality": quality,
         "latency_ms": latency_summary(latencies),
         "throughput": {
@@ -205,8 +227,10 @@ def main_from_args(args: argparse.Namespace) -> int:
         raise ValueError("--concurrency must be positive")
     report = asyncio.run(run_benchmark(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps(report, indent=2, sort_keys=True))
+    # Undefined metrics are None, never NaN, so the artifact must stay strict JSON.
+    serialized = json.dumps(report, indent=2, sort_keys=True, allow_nan=False)
+    args.output.write_text(serialized, encoding="utf-8")
+    print(serialized)
     return 0
 
 
