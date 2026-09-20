@@ -15,8 +15,8 @@ def test_taxonomy_has_seven_independent_l1_domains() -> None:
 
 def test_threshold_policy_separates_binary_label_from_review_band() -> None:
     policy = ThresholdPolicy(default_threshold=0.5, review_margin=0.1)
-    assert policy.is_unsafe({"risk": 0.50})
-    assert not policy.is_unsafe({"risk": 0.49})
+    assert not policy.is_unsafe({"risk": 0.50})
+    assert policy.is_unsafe({"risk": 0.51})
     assert policy.decision({"risk": 0.30}) is Decision.ALLOW
     assert policy.decision({"risk": 0.45}) is Decision.REVIEW
     assert policy.decision({"risk": 0.65}) is Decision.BLOCK
