@@ -99,6 +99,8 @@ The adapter also preserves semicolon-separated multi-label Level-1 ground truth.
 
 ## Benchmark JevGuard
 
+Important: TypeSafe's current Master Customer Agreement includes a restriction on publishing benchmark or performance information about the service. Run Jev measurements locally or in a private repository unless your agreement explicitly permits publication. The included GitHub Actions benchmark job is intentionally disabled when the repository is public.
+
 Example, 1,000 query samples:
 
     jevguard-nsfa bench-jev \
@@ -208,7 +210,7 @@ MVP:
 - cost, latency, quality, throughput and failure metrics
 - Markdown comparison report
 - unit tests and CI
-- manual GitHub Actions Jev benchmark with artifact upload
+- private-repository-only GitHub Actions Jev benchmark with artifact upload
 
 Next:
 - Level-2/Level-3 diagnostic registry
