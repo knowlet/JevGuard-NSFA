@@ -25,6 +25,8 @@ class AlignmentCheck:
     jev: Any
     singguard: Any
     status: str  # "ok" | "mismatch" | "unknown"
+    # Optional precise explanation, used verbatim in the withheld-delta warnings.
+    reason: str | None = None
 
 
 def _raw(data: dict[str, Any], path: str) -> Any:
@@ -77,8 +79,12 @@ _DATA_PATHS: tuple[tuple[str, str], ...] = (
     ("dataset.fingerprint", "dataset.fingerprint"),
     ("parameters.threshold", "parameters.threshold"),
     ("samples.attempted", "samples.attempted"),
-    ("samples.successful_ids_sha256", "samples.successful_ids_sha256"),
+    ("samples.successful_sha256", "samples.successful_sha256"),
 )
+
+# The Jev column of the SingGuard-only checks. JevGuard-NSFA is a managed API:
+# it has no local head set and no batch size of its own.
+_MANAGED_API = "n/a (managed API)"
 
 
 def _equality_check(name: str, jev: dict[str, Any], singguard: dict[str, Any], path: str) -> AlignmentCheck:
@@ -89,6 +95,61 @@ def _equality_check(name: str, jev: dict[str, Any], singguard: dict[str, Any], p
     else:
         status = "ok" if jev_value == singguard_value else "mismatch"
     return AlignmentCheck(name, jev_value, singguard_value, status)
+
+
+def _revision_check(jev: dict[str, Any], singguard: dict[str, Any]) -> AlignmentCheck:
+    """Check the requested dataset revision, which is only a secondary guarantee.
+
+    A revision mismatch is only meaningful when both reports actually recorded a
+    revision, so: both non-null and different => mismatch; both null, or exactly
+    one null, => ok. The primary guarantee is ``dataset.fingerprint``, a
+    full-content digest over id, text, label, side, domains and lang: it is
+    checked on its own, so a report that never recorded a revision cannot
+    contradict it. A missing key is not a null -- it means the report predates
+    the field, so the comparison is unknown rather than silently ok.
+    """
+    jev_value = _raw(jev, "dataset.revision")
+    singguard_value = _raw(singguard, "dataset.revision")
+    if jev_value is _MISSING or singguard_value is _MISSING:
+        status = "unknown"
+    elif jev_value is not None and singguard_value is not None and jev_value != singguard_value:
+        status = "mismatch"
+    else:
+        status = "ok"
+    return AlignmentCheck("dataset.revision", jev_value, singguard_value, status)
+
+
+def _head_manifest_check(singguard: dict[str, Any]) -> AlignmentCheck:
+    """SingGuard must prove its local head set covered every expected domain.
+
+    A run whose heads do not cover the taxonomy can silently drop whole risk
+    domains, so an incomplete (or unreported) head set makes the quality deltas
+    meaningless. This check is one-sided by design: Jev is a managed API with no
+    local head set, so its column renders explicitly rather than as missing.
+    """
+    name = "head_manifest.complete (SingGuard)"
+    complete = _raw(singguard, "head_manifest.complete")
+    if complete is _MISSING:
+        return AlignmentCheck(
+            name,
+            _MANAGED_API,
+            complete,
+            "unknown",
+            "SingGuard head_manifest is missing, so its head coverage cannot be verified",
+        )
+    if complete is True:
+        return AlignmentCheck(name, _MANAGED_API, complete, "ok")
+    missing = _raw(singguard, "head_manifest.missing_domains")
+    unexpected = _raw(singguard, "head_manifest.unexpected_domains")
+    details: list[str] = []
+    if isinstance(missing, list) and missing:
+        details.append(f"missing: {', '.join(str(item) for item in missing)}")
+    if isinstance(unexpected, list) and unexpected:
+        details.append(f"unexpected: {', '.join(str(item) for item in unexpected)}")
+    reason = "SingGuard ran with an incomplete head set"
+    if details:
+        reason = f"{reason} ({'; '.join(details)})"
+    return AlignmentCheck(name, _MANAGED_API, complete, "mismatch", reason)
 
 
 def _latency_checks(jev: dict[str, Any], singguard: dict[str, Any]) -> list[AlignmentCheck]:
@@ -142,8 +203,21 @@ class Alignment:
 
 def alignment(jev: dict[str, Any], singguard: dict[str, Any]) -> Alignment:
     """Verify every metadata item that must agree before a delta is meaningful."""
-    data = [_equality_check(name, jev, singguard, path) for name, path in _DATA_PATHS]
-    return Alignment(data=data, latency=_latency_checks(jev, singguard))
+    return Alignment(data=_data_checks(jev, singguard), latency=_latency_checks(jev, singguard))
+
+
+def _data_checks(jev: dict[str, Any], singguard: dict[str, Any]) -> list[AlignmentCheck]:
+    """Every data alignment check, in the order they are rendered."""
+    checks: list[AlignmentCheck] = []
+    for name, path in _DATA_PATHS:
+        checks.append(_equality_check(name, jev, singguard, path))
+        if name == "dataset.fingerprint":
+            # The requested revision qualifies the fingerprint, so it is checked
+            # right next to the digest it belongs to.
+            checks.append(_revision_check(jev, singguard))
+    # SingGuard runs the heads locally; Jev is a managed API with no local head.
+    checks.append(_head_manifest_check(singguard))
+    return checks
 
 
 def alignment_checks(jev: dict[str, Any], singguard: dict[str, Any]) -> list[AlignmentCheck]:
@@ -199,6 +273,16 @@ def _latency_withheld_reasons(latency: list[AlignmentCheck]) -> list[str]:
     return reasons
 
 
+def _data_withheld_reasons(data: list[AlignmentCheck]) -> list[str]:
+    """Human-readable reasons why the quality rows are not comparable.
+
+    A check that knows why it failed (for example an incomplete SingGuard head
+    set, which names the missing domains) supplies its own reason; every other
+    check falls back to its name and status.
+    """
+    return [check.reason or f"{check.name} ({check.status})" for check in _not_ok(data)]
+
+
 _METRICS: tuple[tuple[str, str, int, str], ...] = (
     ("Binary F1", "quality.binary.f1", 4, QUALITY),
     ("Precision", "quality.binary.precision", 4, QUALITY),
@@ -233,7 +317,7 @@ def _alignment_lines(checks: Alignment) -> list[str]:
     if checks.data_ok:
         lines.append("Data alignment is ok: quality deltas are reported.")
     else:
-        reasons = ", ".join(f"{check.name} ({check.status})" for check in _not_ok(checks.data))
+        reasons = ", ".join(_data_withheld_reasons(checks.data))
         lines.append(
             "WARNING: these runs are not comparable ("
             f"{reasons}); quality deltas are withheld and rendered n/a."
@@ -281,6 +365,8 @@ def render_markdown(jev: dict[str, Any], singguard: dict[str, Any]) -> str:
         "- Latency deltas require `latency_scope` == `request` on both runs and a SingGuard `parameters.batch_size` of 1.",
         "- SingGuard cost is reported only when an explicit GPU hourly price was supplied. Missing cost intentionally remains n/a.",
         "- Cold-start/model-load time is reported separately from steady-state inference and is not mixed into online p50/p95.",
+        "- `dataset.fingerprint` is a full-content digest (id, text, label, side, domains, lang); `dataset.revision` only mismatches when both runs recorded a revision.",
+        "- SingGuard quality deltas also require `head_manifest.complete` == true, so a run whose heads cover only part of the taxonomy cannot pass silently.",
         "",
     ]
     return "\n".join(lines)
@@ -291,12 +377,12 @@ def main_from_args(args: argparse.Namespace) -> int:
     singguard = json.loads(args.singguard.read_text(encoding="utf-8"))
     checks = alignment(jev, singguard)
     markdown = render_markdown(jev, singguard)
-    data_mismatches = [check.name for check in _not_ok(checks.data) if check.status == "mismatch"]
+    data_mismatches = _data_withheld_reasons([check for check in _not_ok(checks.data) if check.status == "mismatch"])
     latency_mismatches = [check.name for check in _not_ok(checks.latency) if check.status == "mismatch"]
     if data_mismatches:
         print(
             "WARNING: benchmark runs are not comparable; mismatched alignment checks: "
-            + ", ".join(data_mismatches)
+            + "; ".join(data_mismatches)
             + ". Quality deltas are withheld."
         )
     if latency_mismatches:
