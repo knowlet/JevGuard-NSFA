@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import inspect
 import json
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -13,6 +16,25 @@ from typing import Any
 from .dataset import BenchmarkRow, canonical_domain, iter_huggingface_rows
 from .metrics import evaluate_guard_results, latency_summary
 from .models import GuardResult, Side, ThresholdPolicy
+
+
+def _sha256_lines(lines: Iterable[str]) -> str:
+    """SHA-256 hex digest of ``"\n".join(lines)`` encoded as UTF-8.
+
+    Byte-identical to ``benchmark_jev._sha256_lines`` so the digests of a shared sample
+    selection match across engines and the comparator can classify the runs as aligned.
+    """
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _rows_fingerprint(rows: Sequence[BenchmarkRow]) -> str:
+    """Identify the attempted sample selection in emitted order."""
+    return _sha256_lines(f"{row.id}|{row.label}|{row.side.value}|{row.lang}" for row in rows)
+
+
+def _rows_id_digest(rows: Sequence[BenchmarkRow]) -> str:
+    """Identify the row ids of a sample subset in emitted order."""
+    return _sha256_lines(row.id for row in rows)
 
 
 def _lazy_runtime() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
@@ -126,6 +148,62 @@ def _load_heads(model: str, heads_dir: str | None, device: str) -> dict[str, dic
     return heads
 
 
+_POOLER_ATTEMPTS: tuple[dict[str, Any], ...] = (
+    # Modern vLLM (main): `use_activation` replaced the old `normalize` flag.
+    {"pooling_type": "LAST", "task": "embed", "use_activation": False},
+    {"pooling_type": "LAST", "use_activation": False},
+    # Legacy vLLM (<= 0.11): `normalize: Optional[bool] = None` and defaults to True.
+    {"pooling_type": "LAST", "task": "embed", "normalize": False},
+    {"pooling_type": "LAST", "normalize": False},
+)
+
+_POOLER_SWITCH_FIELDS: tuple[str, ...] = ("use_activation", "normalize")
+
+
+def _pooler_switches(config: Any) -> dict[str, Any]:
+    return {field: getattr(config, field, "<unset>") for field in _POOLER_SWITCH_FIELDS}
+
+
+def _pooler_is_activation_free(config: Any) -> bool:
+    """Accept a config only when it *explicitly* disables pooling activation/normalisation.
+
+    vLLM documents both `use_activation` and the legacy `normalize` as defaulting to True;
+    a missing or `None` switch therefore means normalisation is enabled.
+    """
+    return any(getattr(config, field, None) is False for field in _POOLER_SWITCH_FIELDS)
+
+
+def _pooler_config(PoolerConfig: Any, *, model: str | None = None) -> Any:
+    """Build a vLLM PoolerConfig that provably disables embedding normalisation.
+
+    The SingGuard NSFA classification heads consume the raw LAST-token hidden state, so a
+    silently normalised pooler would change the input distribution the heads were trained
+    on. A candidate that merely *constructs* is not enough: the resulting object must carry
+    an explicitly disabled switch, otherwise the constructor's default re-enables it.
+    """
+    failures: list[str] = []
+    for kwargs in _POOLER_ATTEMPTS:
+        try:
+            config = PoolerConfig(**kwargs)
+        except (TypeError, ValueError) as exc:
+            failures.append(f"  PoolerConfig(**{kwargs!r}) raised {type(exc).__name__}: {exc}")
+            continue
+        if _pooler_is_activation_free(config):
+            return config
+        failures.append(
+            f"  PoolerConfig(**{kwargs!r}) constructed but left activation enabled: {_pooler_switches(config)}"
+        )
+
+    subject = f"model {model!r}" if model else "the configured model"
+    raise RuntimeError(
+        f"Could not build an activation-free vLLM PoolerConfig for {subject}. "
+        "The SingGuard NSFA realtime benchmark feeds raw, un-normalised LAST-token embeddings "
+        "to the classification heads, so a PoolerConfig with `use_activation`/`normalize` left "
+        "unset (vLLM defaults those to True) -- or a bare PoolerConfig() -- would silently change "
+        "the head input distribution. Attempts:\n" + "\n".join(failures)
+    )
+
+
 def _make_llm(
     model: str,
     max_tokens: int,
@@ -134,19 +212,6 @@ def _make_llm(
     dtype: str,
 ) -> Any:
     _, _, _, _, LLM, PoolerConfig, EngineArgs = _lazy_runtime()
-
-    def pooler() -> Any:
-        candidates = (
-            {"pooling_type": "LAST", "normalize": False, "task": "embed"},
-            {"pooling_type": "LAST", "normalize": False},
-            {"pooling_type": "LAST"},
-        )
-        for kwargs in candidates:
-            try:
-                return PoolerConfig(**kwargs)
-            except (TypeError, ValueError):
-                pass
-        return PoolerConfig()
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -160,10 +225,10 @@ def _make_llm(
     }
     if "runner" in inspect.signature(EngineArgs.__init__).parameters:
         kwargs["runner"] = "pooling"
-        kwargs["pooler_config"] = pooler()
+        kwargs["pooler_config"] = _pooler_config(PoolerConfig, model=model)
     else:
         kwargs["task"] = "embed"
-        kwargs["override_pooler_config"] = pooler()
+        kwargs["override_pooler_config"] = _pooler_config(PoolerConfig, model=model)
     return LLM(**kwargs)
 
 
@@ -217,10 +282,58 @@ def _build_parallel_head_forward(head_modules: list[Any]) -> Any:
     return vmap(one, in_dims=(0, 0, None)), params, buffers
 
 
+@dataclass(frozen=True)
+class _HeadRunner:
+    """Reusable parallel-head execution state for one detection side.
+
+    Built once per task by :func:`_prepare_head_runner`, outside the warmup and the
+    timed measurement loop, so the one-off `torch.func` setup is not charged to
+    steady-state per-request latency.
+    """
+
+    task: str
+    names: tuple[str, ...]
+    forward: Any
+    params: Any
+    buffers: Any
+    max_tokens: int
+    system_prompt: str | None
+
+
+def _prepare_head_runner(heads: dict[str, dict[str, Any]], task: str, device: str) -> _HeadRunner:
+    """Stack the task's heads and build the vmap'd forward exactly once.
+
+    `device` mirrors the signature of `_load_heads`, which has already materialised every
+    head on it; the stacked parameters/buffers inherit that placement.
+    """
+    matching = {name: info for name, info in heads.items() if info["task"] == task}
+    if not matching:
+        raise RuntimeError(f"No classification heads found for task={task!r}")
+    names = tuple(sorted(matching))
+    exemplar = matching[names[0]]
+    forward, params, buffers = _build_parallel_head_forward([matching[name]["head"] for name in names])
+    return _HeadRunner(
+        task=task,
+        names=names,
+        forward=forward,
+        params=params,
+        buffers=buffers,
+        max_tokens=int(exemplar["max_tokens"]),
+        system_prompt=exemplar["system_prompt"],
+    )
+
+
+def _runner_for_side(runners: dict[str, _HeadRunner], side: Side) -> _HeadRunner:
+    try:
+        return runners[side.value]
+    except KeyError as exc:
+        raise RuntimeError(f"No classification heads found for task={side.value!r}") from exc
+
+
 def _infer_batch(
     *,
     llm: Any,
-    heads: dict[str, dict[str, Any]],
+    runner: _HeadRunner,
     tokenizer: Any,
     rows: list[BenchmarkRow],
     device: str,
@@ -232,23 +345,15 @@ def _infer_batch(
     side = rows[0].side
     if any(row.side is not side for row in rows):
         raise ValueError("A SingGuard batch may contain only one detection side")
+    if side.value != runner.task:
+        raise RuntimeError(f"Prepared head runner is for task={runner.task!r} but the batch is {side.value!r}")
 
-    task = side.value
-    matching = {name: info for name, info in heads.items() if info["task"] == task}
-    if not matching:
-        raise RuntimeError(f"No classification heads found for task={task!r}")
-    names = sorted(matching)
-    exemplar = matching[names[0]]
-    effective_max = min(model_max_tokens, int(exemplar["max_tokens"]))
-    system_prompt = exemplar["system_prompt"]
+    effective_max = min(model_max_tokens, runner.max_tokens)
     started = perf_counter()
     prompts = [
-        _prepare_prompt(row.text, side, tokenizer, effective_max, system_prompt)
+        _prepare_prompt(row.text, side, tokenizer, effective_max, runner.system_prompt)
         for row in rows
     ]
-
-    modules = [matching[name]["head"] for name in names]
-    forward, params, buffers = _build_parallel_head_forward(modules)
 
     outputs = llm.embed(prompts, use_tqdm=False)
     embeddings = torch.tensor(
@@ -257,14 +362,14 @@ def _infer_batch(
         device=device,
     )
     with torch.inference_mode():
-        logits = forward(params, buffers, embeddings)
+        logits = runner.forward(runner.params, runner.buffers, embeddings)
         probabilities = torch.softmax(logits, dim=-1).detach().cpu()
     elapsed_ms = (perf_counter() - started) * 1000.0
 
     scores: list[dict[str, float]] = []
     for sample_index in range(len(rows)):
         item: dict[str, float] = {}
-        for head_index, name in enumerate(names):
+        for head_index, name in enumerate(runner.names):
             row_probs = probabilities[head_index, sample_index]
             if row_probs.numel() < 2:
                 raise RuntimeError(f"Expected binary head probabilities for {name!r}")
@@ -309,6 +414,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         args.max_tokens,
     )
     heads = _load_heads(args.model, args.heads_dir, args.device)
+    runner_started = perf_counter()
+    runners = {
+        task: _prepare_head_runner(heads, task, args.device)
+        for task in sorted({info["task"] for info in heads.values()})
+    }
+    classification_head_runner_seconds = perf_counter() - runner_started
     model_load_seconds = perf_counter() - load_started
 
     policy = ThresholdPolicy(default_threshold=args.threshold, review_margin=args.review_margin)
@@ -317,7 +428,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         warm_rows = rows[: min(args.warmup, len(rows))]
         _infer_batch(
             llm=llm,
-            heads=heads,
+            runner=_runner_for_side(runners, warm_rows[0].side),
             tokenizer=tokenizer,
             rows=warm_rows,
             device=args.device,
@@ -325,22 +436,27 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     results: list[GuardResult] = []
+    successful_rows: list[BenchmarkRow] = []
     batch_latencies: list[float] = []
     sample_latencies: list[float] = []
+    amortized_latencies: list[float] = []
     started = perf_counter()
     for offset in range(0, len(rows), args.batch_size):
         batch = rows[offset : offset + args.batch_size]
         batch_scores, batch_ms = _infer_batch(
             llm=llm,
-            heads=heads,
+            runner=_runner_for_side(runners, batch[0].side),
             tokenizer=tokenizer,
             rows=batch,
             device=args.device,
             model_max_tokens=model_max_tokens,
         )
         batch_latencies.append(batch_ms)
-        amortized = batch_ms / len(batch)
-        sample_latencies.extend([amortized] * len(batch))
+        # Every request in a batch waits for the batch to finish, so the request latency
+        # is the full batch wall time; the per-sample cost is a separate, clearly labelled
+        # throughput figure so it cannot be mistaken for a request latency.
+        sample_latencies.extend([batch_ms] * len(batch))
+        amortized_latencies.extend([batch_ms / len(batch)] * len(batch))
         for row, scores in zip(batch, batch_scores, strict=True):
             predicted_domain = max(scores, key=scores.get)
             max_risk = scores[predicted_domain]
@@ -352,10 +468,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     decision=policy.decision(scores),
                     predicted_domain=predicted_domain,
                     max_risk=max_risk,
-                    latency_ms=amortized,
+                    latency_ms=batch_ms,
                     model=args.model,
                 )
             )
+            successful_rows.append(row)
     wall_seconds = perf_counter() - started
 
     quality = evaluate_guard_results(rows, results, threshold=args.threshold)
@@ -393,6 +510,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "languages": sorted(languages) if languages else None,
             "id_contains": args.id_contains,
             "seed": args.seed,
+            "fingerprint": _rows_fingerprint(rows),
         },
         "parameters": {
             "threshold": args.threshold,
@@ -408,13 +526,33 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "attempted": len(rows),
             "successful": len(results),
             "failed": 0,
+            "attempted_ids_sha256": _rows_id_digest(rows),
+            "successful_ids_sha256": _rows_id_digest(successful_rows),
         },
         "quality": quality,
         "cold_start": {
             "model_and_head_load_seconds": model_load_seconds,
+            "classification_head_runner_seconds": classification_head_runner_seconds,
             "allocated_gpu_cost_usd": cold_start_cost,
         },
+        "latency_scope": "request",
+        "latency_notes": {
+            "latency_ms": (
+                "Per-request latency: every request in a batch waits for the whole batch, so each "
+                "sample is charged the full batch wall time."
+            ),
+            "amortized_ms_per_sample": (
+                "Batch wall time divided by the number of samples: a throughput-style per-sample "
+                "cost, not a request latency."
+            ),
+            "batch_latency_ms": "Wall time per batch.",
+            "pairing": (
+                "amortized_ms_per_sample == latency_ms / parameters.batch_size; compare latency_ms, "
+                "not amortized_ms_per_sample, against per-request managed-API latency."
+            ),
+        },
         "latency_ms": latency_summary(sample_latencies),
+        "amortized_ms_per_sample": latency_summary(amortized_latencies),
         "batch_latency_ms": latency_summary(batch_latencies),
         "throughput": {
             "wall_seconds": wall_seconds,
@@ -462,8 +600,9 @@ def main_from_args(args: argparse.Namespace) -> int:
         raise ValueError("--batch-size must be positive")
     report = run_benchmark(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps(report, indent=2, sort_keys=True))
+    rendered = json.dumps(report, indent=2, sort_keys=True, allow_nan=False)
+    args.output.write_text(rendered, encoding="utf-8")
+    print(rendered)
     return 0
 
 
