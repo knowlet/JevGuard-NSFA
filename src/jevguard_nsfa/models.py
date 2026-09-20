@@ -42,7 +42,7 @@ class ThresholdPolicy:
         return float(self.domain_thresholds.get(domain, self.default_threshold))
 
     def is_unsafe(self, scores: Mapping[str, float]) -> bool:
-        return any(score >= self.threshold_for(domain) for domain, score in scores.items())
+        return any(score > self.threshold_for(domain) for domain, score in scores.items())
 
     def decision(self, scores: Mapping[str, float]) -> Decision:
         if not scores:
