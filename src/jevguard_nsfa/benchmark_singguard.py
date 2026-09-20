@@ -56,7 +56,7 @@ def _head_class(nn: Any) -> type:
 
             dims = [input_size, *(hidden_dims or [])]
             self.layers = nn.ModuleList()
-            for source, target in zip(dims, dims[1:], strict=True):
+            for source, target in zip(dims, dims[1:]):
                 modules: list[Any] = [nn.Linear(source, target)]
                 if use_layer_norm:
                     modules.append(nn.LayerNorm(target))
