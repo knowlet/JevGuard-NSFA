@@ -14,7 +14,7 @@ from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
 from .dataset import BenchmarkRow, iter_huggingface_rows
 from .guard import AsyncJevGuard
 from .metrics import evaluate_guard_results, latency_summary
-from .models import GuardResult, Side, ThresholdPolicy
+from .models import GuardResult, ThresholdPolicy
 
 DEFAULT_DATASET = "inclusionAI/NSFA_Benchmarks"
 DEFAULT_JEV_INPUT_USD_PER_MILLION = 0.042
