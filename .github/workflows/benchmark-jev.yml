@@ -34,9 +34,6 @@ permissions:
 
 jobs:
   benchmark:
-    # TypeSafe's current MCA restricts publishing benchmark/performance information.
-    # Keep actual Jev measurements in a private repository or local environment.
-    if: ${{ github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
