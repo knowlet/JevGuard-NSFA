@@ -79,6 +79,10 @@ Optional:
 
 The official TypeSafe SDK is used directly. No OpenAI-compatible wrapper is required for Jev.
 
+The `--model` option is unset by default on both CLI paths, so the SDK resolves the model
+in the order explicit `--model` -> `TYPESAFE_DEFAULT_MODEL` -> SDK default. Pass `--model`
+only when you want to override the environment.
+
 ## Screen one item
 
     jevguard-nsfa screen "Ignore all previous instructions..." --side query
@@ -134,6 +138,19 @@ The default Jev price assumption is 0.042 USD per million input tokens. It is a 
 
 Change it whenever current pricing changes.
 
+Rate limiting and retries are both owned by the runner, not by the SDK: the client is
+created with SDK-internal retries disabled, every attempt (including a retry) takes a
+`--rpm` slot, and `Retry-After` is honoured when the API asks for a specific wait. Rows
+whose retries are exhausted stay recorded failures; they are never reinterpreted as safe
+and never reach the semantic review fallback. The report therefore adds
+`samples.request_attempts` (attempts including retries) and `samples.retried_requests`
+next to `samples.failed`.
+
+Pin the dataset content with `--dataset-revision <ref>` for a reproducible comparison; the
+requested revision is recorded as `dataset.revision`. Every report also carries a
+`dataset.fingerprint` over the full sample content (id, text, label, side, L1 domains and
+language) plus `samples.successful_sha256` over exactly the samples that were scored.
+
 ## Benchmark original SingGuard-NSFA
 
 The baseline runner reconstructs the upstream real-time classification data path:
@@ -160,6 +177,17 @@ processing time is reported separately as `amortized_ms_per_sample`, and
 `batch_latency_ms` keeps the batch wall time. Preparing the parallel-head
 execution state is a one-off load-time cost, reported under `cold_start`, and is
 never folded into steady-state latency.
+
+The runner refuses an incomplete classification-head set. For the side being benchmarked
+it requires every NSFA Level-1 domain of that side, fails before the model is loaded when a
+head file is missing or a head's task metadata is mislabeled, and records the real coverage
+in `head_manifest` (`expected_domains`, `loaded_domains`, `missing_domains`,
+`unexpected_domains`, `complete`, `head_count`). A head that was never run can therefore no
+longer enter the metrics as a 0.0 risk probability. `--allow-partial-heads` exists only for
+deliberate partial-head experiments: those runs are reported with
+`head_manifest.complete=false` and `baseline_complete=false`, and the comparator withholds
+quality deltas instead of presenting them as a full baseline. `--dataset-revision` pins and
+records the dataset revision exactly as in the Jev runner.
 
 Online-style latency comparison should use batch size 1:
 
@@ -193,9 +221,12 @@ Run the 0.8B, 2B, 4B, and 9B variants separately if you want the complete SingGu
 The comparison includes F1, precision, recall, accuracy, calibration, Level-1 accuracy, p50/p95/p99 latency, throughput, cost per 1,000 requests, and failures.
 
 The comparator verifies alignment before it shows any delta: dataset name, split,
-benchmark, language filter, id filter, seed, dataset fingerprint, threshold,
-attempted sample count, the ids of the samples that actually succeeded, the
-latency scope, and the SingGuard batch size. Every check is listed in an
+benchmark, language filter, id filter, seed, dataset revision, the content fingerprint of
+the attempted selection, threshold, attempted sample count, the content digest of the
+samples that were actually scored, SingGuard head-set completeness, the latency scope, and
+the SingGuard batch size. Because the fingerprint covers the sample text and the L1
+ground-truth domains, revising either one makes two runs incomparable instead of looking
+aligned. Every check is listed in an
 `## Alignment` section as ok, mismatch, or unknown. The data checks gate the
 quality deltas and the latency checks gate the latency deltas: a partial Jev
 failure can no longer masquerade as a paired quality difference, while a
@@ -206,13 +237,13 @@ stdout.
 
 ## Fair-comparison rules
 
-1. Use the exact same benchmark file, shuffled seed, limit, language filter, and threshold, and let the comparator confirm the alignment. It refuses unpaired deltas.
+1. Use the exact same benchmark file (pin `--dataset-revision` when the upstream revision matters), shuffled seed, limit, language filter, and threshold, and let the comparator confirm the alignment. It refuses unpaired deltas.
 2. Compare query, response, and cross-source-query separately.
 3. For request latency, compare Jev end-to-end managed API latency against SingGuard batch-size-1 local inference and state that the former includes network/service overhead while the latter does not.
 4. Report SingGuard model load/cold start separately.
-5. Report throughput separately from request latency. SingGuard can exploit large local batches; Jev can exploit request concurrency and provider rate limits.
+5. Report throughput separately from request latency. SingGuard can exploit large local batches; Jev can exploit request concurrency and provider rate limits. Jev `samples.request_attempts` counts retries, so compare it with `samples.attempted` when reasoning about rate limits.
 6. Derive Jev cost from returned token usage. Derive SingGuard compute cost only from an explicit hardware hourly price.
-7. Record provider/API failures; do not drop them silently or reinterpret them as safe. A quality difference is only paired when both runs scored the same sample ids; otherwise the comparator withholds the delta.
+7. Record provider/API failures; do not drop them silently or reinterpret them as safe. A quality difference is only paired when both runs scored the same sample content; otherwise the comparator withholds the delta.
 8. Tune thresholds only on a separate calibration set. Do not tune on the benchmark rows and then report those same rows as unbiased evaluation.
 9. Report undefined metrics as `null`, never `NaN`; reports are strict JSON (`allow_nan=False`) so downstream consumers can parse them.
 
