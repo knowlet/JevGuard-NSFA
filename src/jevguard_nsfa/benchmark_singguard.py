@@ -241,6 +241,7 @@ def _infer_batch(
     exemplar = matching[names[0]]
     effective_max = min(model_max_tokens, int(exemplar["max_tokens"]))
     system_prompt = exemplar["system_prompt"]
+    started = perf_counter()
     prompts = [
         _prepare_prompt(row.text, side, tokenizer, effective_max, system_prompt)
         for row in rows
@@ -249,7 +250,6 @@ def _infer_batch(
     modules = [matching[name]["head"] for name in names]
     forward, params, buffers = _build_parallel_head_forward(modules)
 
-    started = perf_counter()
     outputs = llm.embed(prompts, use_tqdm=False)
     embeddings = torch.tensor(
         [output.outputs.embedding for output in outputs],
