@@ -47,6 +47,12 @@ _DOMAIN_ALIASES.update(
 _QUERY_IDS = {domain.id for domain in DOMAINS if domain.side is Side.QUERY}
 _RESPONSE_IDS = {domain.id for domain in DOMAINS if domain.side is Side.RESPONSE}
 
+BENCHMARK_FILES: dict[str, tuple[str, Side]] = {
+    "query": ("NSFA_Query_Multilingual.parquet", Side.QUERY),
+    "response": ("NSFA_Response_Multilingual.parquet", Side.RESPONSE),
+    "cross-source-query": ("NSFA_CrossSource_Query_Multilingual.parquet", Side.QUERY),
+}
+
 
 def canonical_domain(value: Any) -> str | None:
     domains = canonical_domains(value)
@@ -121,6 +127,7 @@ def iter_huggingface_rows(
     *,
     dataset_name: str = "inclusionAI/NSFA_Benchmarks",
     split: str = "train",
+    benchmark: str | None = None,
     side: Side | None = None,
     languages: set[str] | None = None,
     id_contains: str | None = None,
@@ -132,7 +139,19 @@ def iter_huggingface_rows(
     except ImportError as exc:  # pragma: no cover - dependency error
         raise RuntimeError("Install the benchmark extra: pip install -e '.[benchmark]'") from exc
 
-    dataset = load_dataset(dataset_name, split=split)
+    forced_side = side
+    if benchmark is not None:
+        try:
+            filename, benchmark_side = BENCHMARK_FILES[benchmark]
+        except KeyError as exc:
+            raise ValueError(f"Unknown NSFA benchmark {benchmark!r}") from exc
+        if side is not None and side is not benchmark_side:
+            raise ValueError(f"Benchmark {benchmark!r} is {benchmark_side.value}-side, not {side.value}-side")
+        forced_side = benchmark_side
+        source = f"hf://datasets/{dataset_name}/{filename}"
+        dataset = load_dataset("parquet", data_files={"train": source}, split=split)
+    else:
+        dataset = load_dataset(dataset_name, split=split)
     if seed is not None:
         dataset = dataset.shuffle(seed=seed)
 
@@ -144,12 +163,12 @@ def iter_huggingface_rows(
         if languages and str(row.get("lang", "")) not in languages:
             continue
         try:
-            parsed = row_from_mapping(row, forced_side=None)
+            parsed = row_from_mapping(row, forced_side=forced_side)
         except ValueError:
-            if side is None:
+            if forced_side is None:
                 raise
-            parsed = row_from_mapping(row, forced_side=side)
-        if side is not None and parsed.side is not side:
+            parsed = row_from_mapping(row, forced_side=forced_side)
+        if forced_side is not None and parsed.side is not forced_side:
             continue
         yield parsed
         emitted += 1
