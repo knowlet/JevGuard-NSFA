@@ -134,11 +134,22 @@ def iter_huggingface_rows(
     id_contains: str | None = None,
     limit: int | None = None,
     seed: int | None = None,
+    revision: str | None = None,
 ) -> Iterable[BenchmarkRow]:
+    """Yield the selected benchmark rows in emitted order.
+
+    ``revision`` is forwarded to ``load_dataset`` unchanged, but only when it is set: the
+    default ``None`` means "whatever the hub resolves as latest", and the benchmark runners
+    record that unresolvable case as a JSON ``null`` instead of inventing a revision name.
+    """
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - dependency error
         raise RuntimeError("Install the benchmark extra: pip install -e '.[benchmark]'") from exc
+
+    load_kwargs: dict[str, Any] = {"split": split}
+    if revision is not None:
+        load_kwargs["revision"] = revision
 
     forced_side = side
     if benchmark is not None:
@@ -150,9 +161,9 @@ def iter_huggingface_rows(
             raise ValueError(f"Benchmark {benchmark!r} is {benchmark_side.value}-side, not {side.value}-side")
         forced_side = benchmark_side
         source = f"hf://datasets/{dataset_name}/{filename}"
-        dataset = load_dataset("parquet", data_files={"train": source}, split=split)
+        dataset = load_dataset("parquet", data_files={"train": source}, **load_kwargs)
     else:
-        dataset = load_dataset(dataset_name, split=split)
+        dataset = load_dataset(dataset_name, **load_kwargs)
     if seed is not None:
         dataset = dataset.shuffle(seed=seed)
 

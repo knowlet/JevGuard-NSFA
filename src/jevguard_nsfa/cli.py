@@ -22,14 +22,21 @@ def _screen(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the full command line parser, including every subcommand's own arguments."""
     parser = argparse.ArgumentParser(prog="jevguard-nsfa", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     screen = sub.add_parser("screen", help="Screen one query or response with Jev")
     screen.add_argument("text")
     screen.add_argument("--side", choices=["query", "response"], required=True)
-    screen.add_argument("--model", default="jev-latest")
+    # Left unset so the SDK resolves the model as explicit value -> TYPESAFE_DEFAULT_MODEL -> SDK
+    # default; a hardcoded default here would make the environment variable unreachable.
+    screen.add_argument(
+        "--model",
+        default=None,
+        help="TypeSafe model name; omitted means TYPESAFE_DEFAULT_MODEL or the SDK default",
+    )
     screen.add_argument("--base-url", default=None)
     screen.add_argument("--threshold", type=float, default=0.5)
     screen.add_argument("--review-margin", type=float, default=0.10)
@@ -50,7 +57,11 @@ def main() -> int:
     compare.add_arguments(comp)
     comp.set_defaults(handler=compare.main_from_args)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     return int(args.handler(args))
 
 

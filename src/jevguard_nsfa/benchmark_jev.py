@@ -1,4 +1,25 @@
-"""End-to-end benchmark runner for JevGuard-NSFA."""
+"""End-to-end benchmark runner for JevGuard-NSFA.
+
+Retry ownership
+---------------
+The SDK client is built with ``RetryPolicy(max_retries=0)``, so one ``guard.screen`` call is
+exactly one HTTP attempt. Retries are owned by this runner instead: every attempt -- including a
+retry -- acquires :class:`RequestStartLimiter` immediately before it is sent, so a retried request
+is visible to the provider rate limiter rather than multiplying requests behind its back. The
+retryable set mirrors the SDK defaults: connection and timeout errors, plus HTTP 408, 429 and 5xx.
+
+Operational failures stay failures: a row whose attempts are exhausted is recorded with its error,
+never reinterpreted as a safe verdict and never turned into a System-Two fallback (see guard.py).
+``samples.request_attempts`` and ``samples.retried_requests`` count the measured rows only, and a
+row holds its ``--concurrency`` slot across its attempts, so concurrency keeps bounding in-flight
+rows while the attempt budget bounds how long one row can hold a slot.
+
+``--timeout`` is the per-request HTTP timeout handed to the SDK and is also used as the total
+budget for one row's attempt sequence: a retry is not started when its wait would push the row past
+that budget, so a row cannot outlive the deadline the operator configured. The per-attempt wait is
+``Retry-After`` when the failure carries it, otherwise exponential backoff from 0.5s with jitter,
+capped at ``_RETRY_WAIT_CAP_SECONDS``.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +27,21 @@ import argparse
 import asyncio
 import hashlib
 import json
-from collections.abc import Iterable, Sequence
+import math
+import random
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter, time
 from typing import Any
 
-from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
+from typesafe_sdk import (
+    AsyncTypeSafeClient,
+    RetryPolicy,
+    TypeSafeAPIConnectionError,
+    TypeSafeAPIError,
+    TypeSafeAPITimeoutError,
+)
 
 from .dataset import BenchmarkRow, iter_huggingface_rows
 from .guard import AsyncJevGuard
@@ -21,20 +51,115 @@ from .models import GuardResult, ThresholdPolicy
 DEFAULT_DATASET = "inclusionAI/NSFA_Benchmarks"
 DEFAULT_JEV_INPUT_USD_PER_MILLION = 0.042
 
+# Mirrors ``typesafe_sdk.RetryPolicy``'s default retryable HTTP statuses.
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429})
+_RETRY_BACKOFF_INITIAL_SECONDS = 0.5
+_RETRY_BACKOFF_CAP_SECONDS = 8.0
+_RETRY_BACKOFF_JITTER = 0.25
+_RETRY_WAIT_CAP_SECONDS = 30.0
+
 
 def _sha256_lines(lines: Iterable[str]) -> str:
     """SHA-256 hex digest of ``"\n".join(lines)`` encoded as UTF-8."""
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+def _sample_identity(row: BenchmarkRow) -> str:
+    """Canonical JSON identity of one sample, byte-identical to ``benchmark_singguard._sample_identity``.
+
+    The fingerprint must cover everything that changes what was measured, not just the row id:
+    two runs over the same ids with different texts, labels, sides, L1 domains or languages are
+    different selections and must not be reported as aligned.
+    """
+    return json.dumps(
+        [row.id, row.text, row.label, row.side.value, list(row.domains), row.lang],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _rows_fingerprint(rows: Sequence[BenchmarkRow]) -> str:
     """Identify the attempted sample selection in emitted order."""
-    return _sha256_lines(f"{row.id}|{row.label}|{row.side.value}|{row.lang}" for row in rows)
+    return _sha256_lines(_sample_identity(row) for row in rows)
 
 
 def _rows_id_digest(rows: Sequence[BenchmarkRow]) -> str:
     """Identify the row ids of a sample subset in emitted order."""
     return _sha256_lines(row.id for row in rows)
+
+
+def _is_retryable(error: BaseException) -> bool:
+    """Classify a failure exactly like the SDK's default retry predicate.
+
+    Transport-level failures (connection, timeout) and HTTP 408/429/5xx are retryable; everything
+    else -- authentication, permission, bad request, an unparseable 200 response -- fails the row
+    immediately, because retrying it would only repeat a non-transient mistake.
+    """
+    if isinstance(error, (TypeSafeAPITimeoutError, TypeSafeAPIConnectionError)):
+        return True
+    if isinstance(error, TypeSafeAPIError):
+        return error.status in _RETRYABLE_HTTP_STATUSES or 500 <= error.status <= 599
+    return False
+
+
+def _retry_after_header_seconds(value: str, *, milliseconds: bool) -> float | None:
+    """Parse one ``Retry-After`` style header value, or ``None`` when it is unusable."""
+    try:
+        numeric = float(value.strip())
+    except (AttributeError, TypeError, ValueError):
+        numeric = None
+    if numeric is not None:
+        if not math.isfinite(numeric) or numeric < 0:
+            return None
+        return numeric / 1000.0 if milliseconds else numeric
+    if milliseconds:
+        return None
+    try:
+        delta = parsedate_to_datetime(value).timestamp() - time()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return max(0.0, delta) if math.isfinite(delta) else None
+
+
+def _retry_after_seconds(error: BaseException) -> float | None:
+    """The server's requested wait in seconds, from the SDK attribute or the response headers."""
+    retry_after_ms = getattr(error, "retry_after_ms", None)
+    if isinstance(retry_after_ms, (int, float)) and not isinstance(retry_after_ms, bool):
+        if math.isfinite(retry_after_ms) and retry_after_ms >= 0:
+            return float(retry_after_ms) / 1000.0
+        return None
+
+    headers = getattr(error, "headers", None)
+    get_header = getattr(headers, "get", None)
+    if not callable(get_header):
+        return None
+    raw_ms = get_header("retry-after-ms")
+    if raw_ms is not None:
+        return _retry_after_header_seconds(raw_ms, milliseconds=True)
+    raw = get_header("retry-after")
+    if raw is not None:
+        return _retry_after_header_seconds(raw, milliseconds=False)
+    return None
+
+
+def retry_wait_seconds(attempt: int, error: BaseException) -> float:
+    """Delay in seconds before the next attempt, for the 1-based ``attempt`` that just failed.
+
+    ``Retry-After`` wins when the failure exposes one; otherwise the wait is exponential backoff
+    from 0.5s (jittered, capped). Any wait is itself capped, so a hostile server cannot pin the
+    runner on one row.
+    """
+    delay = _retry_after_seconds(error)
+    if delay is None:
+        delay = min(_RETRY_BACKOFF_INITIAL_SECONDS * 2 ** (attempt - 1), _RETRY_BACKOFF_CAP_SECONDS)
+        delay *= 1.0 - _RETRY_BACKOFF_JITTER * random.random()
+    return min(delay, _RETRY_WAIT_CAP_SECONDS)
+
+
+async def _sleep(seconds: float) -> None:
+    """Default inter-attempt sleep; tests inject their own so no test ever waits."""
+    if seconds > 0:
+        await asyncio.sleep(seconds)
 
 
 class RequestStartLimiter:
@@ -58,22 +183,73 @@ class RequestStartLimiter:
             self._next = max(self._next, now) + self.interval
 
 
+async def _screen_with_attempts(
+    row: BenchmarkRow,
+    guard: AsyncJevGuard,
+    limiter: RequestStartLimiter,
+    *,
+    retries: int,
+    budget: float | None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> tuple[GuardResult | None, str | None, int]:
+    """Screen one row, retrying only what the SDK itself would retry.
+
+    With ``RetryPolicy(max_retries=0)`` each ``guard.screen`` call is exactly one real HTTP
+    attempt, so the limiter is acquired immediately before every attempt and the provider sees the
+    true request rate. A failure is reported as a failure; it is never converted into a verdict.
+    """
+    sleeper = sleep or _sleep
+    now = clock or monotonic
+    started = 0.0
+    attempts = 0
+    while True:
+        await limiter.acquire()
+        if attempts == 0:
+            # The retry budget covers the attempts and their waits: provider pacing from the
+            # limiter is charged to the run's rpm budget, not to this row's retry budget.
+            started = now()
+        attempts += 1
+        try:
+            return await guard.screen(row.text, row.side), None, attempts
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if attempts > retries or not _is_retryable(exc):
+                return None, error, attempts
+            delay = retry_wait_seconds(attempts, exc)
+            if budget is not None and now() - started + delay >= budget:
+                return None, error, attempts
+            await sleeper(delay)
+
+
 async def _run_one(
     row: BenchmarkRow,
     guard: AsyncJevGuard,
     semaphore: asyncio.Semaphore,
     limiter: RequestStartLimiter,
-) -> tuple[BenchmarkRow, GuardResult | None, str | None]:
+    *,
+    retries: int = 0,
+    budget: float | None = None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> tuple[BenchmarkRow, GuardResult | None, str | None, int]:
+    """Run one row under the concurrency semaphore; return its result (or error) and attempt count."""
     async with semaphore:
-        await limiter.acquire()
-        try:
-            return row, await guard.screen(row.text, row.side), None
-        except Exception as exc:
-            return row, None, f"{type(exc).__name__}: {exc}"
+        result, error, attempts = await _screen_with_attempts(
+            row,
+            guard,
+            limiter,
+            retries=retries,
+            budget=budget,
+            sleep=sleep,
+            clock=clock,
+        )
+    return row, result, error, attempts
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     languages = set(args.language) if args.language else None
+    dataset_revision = getattr(args, "dataset_revision", None)
     rows = list(
         iter_huggingface_rows(
             dataset_name=args.dataset,
@@ -83,6 +259,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             id_contains=args.id_contains,
             limit=args.limit,
             seed=args.seed,
+            revision=dataset_revision,
         )
     )
     if not rows:
@@ -91,7 +268,10 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     policy = ThresholdPolicy(default_threshold=args.threshold, review_margin=args.review_margin)
     limiter = RequestStartLimiter(args.rpm)
     semaphore = asyncio.Semaphore(args.concurrency)
-    retry = RetryPolicy(max_retries=args.retries)
+    # SDK retries are disabled on purpose: this runner retries so that every real HTTP attempt is
+    # acquired from the limiter and counted in samples.request_attempts.
+    retry = RetryPolicy(max_retries=0)
+    retry_budget = float(args.timeout) if args.timeout and args.timeout > 0 else None
 
     warmup_tokens = 0
     async with AsyncTypeSafeClient(
@@ -109,16 +289,24 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         started = perf_counter()
         outcomes = await asyncio.gather(
-            *(_run_one(row, guard, semaphore, limiter) for row in rows)
+            *(
+                _run_one(row, guard, semaphore, limiter, retries=args.retries, budget=retry_budget)
+                for row in rows
+            )
         )
         wall_seconds = perf_counter() - started
 
     successful_rows: list[BenchmarkRow] = []
     results: list[GuardResult] = []
-    failures: list[dict[str, str]] = []
-    for row, result, error in outcomes:
+    failures: list[dict[str, Any]] = []
+    request_attempts = 0
+    retried_requests = 0
+    for row, result, error, attempts in outcomes:
+        request_attempts += attempts
+        if attempts > 1:
+            retried_requests += 1
         if result is None:
-            failures.append({"id": row.id, "error": error or "unknown error"})
+            failures.append({"id": row.id, "error": error or "unknown error", "attempts": attempts})
         else:
             successful_rows.append(row)
             results.append(result)
@@ -155,6 +343,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "languages": sorted(languages) if languages else None,
             "id_contains": args.id_contains,
             "seed": args.seed,
+            # The revision actually requested, or null when the hub's default revision was used.
+            "revision": dataset_revision,
             "fingerprint": _rows_fingerprint(rows),
         },
         "parameters": {
@@ -171,8 +361,15 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "attempted": len(rows),
             "successful": len(results),
             "failed": len(failures),
+            # Diagnostic only, and deliberately id-only: the comparator gates on the
+            # content-covering fingerprints, never on this digest.
             "attempted_ids_sha256": _rows_id_digest(rows),
-            "successful_ids_sha256": _rows_id_digest(successful_rows),
+            # Covers the rows that actually produced a scored result.
+            "successful_sha256": _rows_fingerprint(successful_rows),
+            # Screening attempts including runner-managed retries; attempted/successful/failed
+            # above keep counting rows.
+            "request_attempts": request_attempts,
+            "retried_requests": retried_requests,
         },
         # Jev latency_ms is managed-API end-to-end latency for a single request.
         "latency_scope": "request",
@@ -199,6 +396,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--split", default="train")
     parser.add_argument(
+        "--dataset-revision",
+        default=None,
+        help="Dataset revision (branch, tag or commit) to load; omitted means the hub default",
+    )
+    parser.add_argument(
         "--benchmark",
         choices=["query", "response", "cross-source-query"],
         default="query",
@@ -207,14 +409,30 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--id-contains", default=None, help="Optional substring filter for dataset row ids")
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--model", default="jev-latest")
+    # Left unset so the SDK resolves the model as explicit value -> TYPESAFE_DEFAULT_MODEL -> SDK
+    # default; a hardcoded default here would make the environment variable unreachable.
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="TypeSafe model name; omitted means TYPESAFE_DEFAULT_MODEL or the SDK default",
+    )
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--review-margin", type=float, default=0.10)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--rpm", type=float, default=900.0)
-    parser.add_argument("--timeout", type=float, default=15.0)
-    parser.add_argument("--retries", type=int, default=0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="Per-request HTTP timeout in seconds; also the total attempt budget for one row",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Runner-managed retries per row; each attempt is acquired from the request limiter",
+    )
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--input-price-per-million", type=float, default=DEFAULT_JEV_INPUT_USD_PER_MILLION)
     parser.add_argument("--output", type=Path, default=Path("benchmark-results/jevguard.json"))
@@ -225,6 +443,8 @@ def main_from_args(args: argparse.Namespace) -> int:
         raise ValueError("--limit must be positive")
     if args.concurrency <= 0:
         raise ValueError("--concurrency must be positive")
+    if args.retries < 0:
+        raise ValueError("--retries must be non-negative")
     report = asyncio.run(run_benchmark(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Undefined metrics are None, never NaN, so the artifact must stay strict JSON.
