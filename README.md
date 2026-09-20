@@ -145,6 +145,22 @@ The baseline runner reconstructs the upstream real-time classification data path
       -> all matching NSFA MLP heads in parallel with torch.vmap
       -> class-1 risk probabilities
 
+The baseline asks the pooler for the raw LAST-token hidden state. Recent vLLM
+releases replaced the `normalize` switch with `use_activation`, so the runner
+tries the modern switch first, checks on the constructed configuration that
+activation and normalisation are really disabled, and fails loudly when it
+cannot verify that. A silently activated pooler would change the vectors the
+NSFA heads were trained on, and every quality number derived from them.
+
+`latency_ms` is the per-request latency: a sample grouped into a batch waits for
+the whole batch to finish, so a batch of 4 samples taking 80 ms is reported as
+80 ms per request, not 20 ms. Online comparison against the managed API is
+therefore only meaningful at `--batch-size 1`. The per-sample amortised
+processing time is reported separately as `amortized_ms_per_sample`, and
+`batch_latency_ms` keeps the batch wall time. Preparing the parallel-head
+execution state is a one-off load-time cost, reported under `cold_start`, and is
+never folded into steady-state latency.
+
 Online-style latency comparison should use batch size 1:
 
     jevguard-nsfa bench-singguard \
@@ -176,16 +192,29 @@ Run the 0.8B, 2B, 4B, and 9B variants separately if you want the complete SingGu
 
 The comparison includes F1, precision, recall, accuracy, calibration, Level-1 accuracy, p50/p95/p99 latency, throughput, cost per 1,000 requests, and failures.
 
+The comparator verifies alignment before it shows any delta: dataset name, split,
+benchmark, language filter, id filter, seed, dataset fingerprint, threshold,
+attempted sample count, the ids of the samples that actually succeeded, the
+latency scope, and the SingGuard batch size. Every check is listed in an
+`## Alignment` section as ok, mismatch, or unknown. The data checks gate the
+quality deltas and the latency checks gate the latency deltas: a partial Jev
+failure can no longer masquerade as a paired quality difference, while a
+throughput run with a large batch size still reports its quality delta and only
+loses the latency delta. Per-engine values are always printed; a withheld delta
+renders as n/a, the reason is stated in the report, and a warning is printed to
+stdout.
+
 ## Fair-comparison rules
 
-1. Use the exact same benchmark file, shuffled seed, limit, language filter, and threshold.
+1. Use the exact same benchmark file, shuffled seed, limit, language filter, and threshold, and let the comparator confirm the alignment. It refuses unpaired deltas.
 2. Compare query, response, and cross-source-query separately.
 3. For request latency, compare Jev end-to-end managed API latency against SingGuard batch-size-1 local inference and state that the former includes network/service overhead while the latter does not.
 4. Report SingGuard model load/cold start separately.
 5. Report throughput separately from request latency. SingGuard can exploit large local batches; Jev can exploit request concurrency and provider rate limits.
 6. Derive Jev cost from returned token usage. Derive SingGuard compute cost only from an explicit hardware hourly price.
-7. Record provider/API failures; do not drop them silently or reinterpret them as safe.
+7. Record provider/API failures; do not drop them silently or reinterpret them as safe. A quality difference is only paired when both runs scored the same sample ids; otherwise the comparator withholds the delta.
 8. Tune thresholds only on a separate calibration set. Do not tune on the benchmark rows and then report those same rows as unbiased evaluation.
+9. Report undefined metrics as `null`, never `NaN`; reports are strict JSON (`allow_nan=False`) so downstream consumers can parse them.
 
 ## Published upstream reference points
 
