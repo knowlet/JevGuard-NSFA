@@ -12,7 +12,7 @@ from typing import Any
 
 from .dataset import BenchmarkRow, canonical_domain, iter_huggingface_rows
 from .metrics import evaluate_guard_results, latency_summary
-from .models import Decision, GuardResult, Side, ThresholdPolicy
+from .models import GuardResult, Side, ThresholdPolicy
 
 
 def _lazy_runtime() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
@@ -20,7 +20,6 @@ def _lazy_runtime() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
         import torch
         import torch.nn as nn
         from huggingface_hub import snapshot_download
-        from torch.func import functional_call, stack_module_state, vmap
         from transformers import AutoTokenizer
         from vllm import LLM
         from vllm.config import PoolerConfig
@@ -56,7 +55,7 @@ def _head_class(nn: Any) -> type:
 
             dims = [input_size, *(hidden_dims or [])]
             self.layers = nn.ModuleList()
-            for source, target in zip(dims, dims[1:]):
+            for source, target in zip(dims, dims[1:], strict=False):
                 modules: list[Any] = [nn.Linear(source, target)]
                 if use_layer_norm:
                     modules.append(nn.LayerNorm(target))
@@ -207,7 +206,6 @@ def _prepare_prompt(text: str, side: Side, tokenizer: Any, max_tokens: int, syst
 
 
 def _build_parallel_head_forward(head_modules: list[Any]) -> Any:
-    torch, _, _, _, _, _, _ = _lazy_runtime()
     from torch.func import functional_call, stack_module_state, vmap
 
     params, buffers = stack_module_state(head_modules)
