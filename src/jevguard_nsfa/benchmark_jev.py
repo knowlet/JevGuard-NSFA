@@ -115,8 +115,16 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     token_values = [result.input_tokens for result in results]
     known_input_tokens = sum(value or 0 for value in token_values)
     usage_complete = all(value is not None for value in token_values)
-    api_cost_usd = known_input_tokens * args.input_price_per_million / 1_000_000.0
-    cost_per_1k = api_cost_usd * 1000.0 / len(results) if results else None
+    api_cost_usd = (
+        known_input_tokens * args.input_price_per_million / 1_000_000.0
+        if usage_complete
+        else None
+    )
+    cost_per_1k = (
+        api_cost_usd * 1000.0 / len(results)
+        if api_cost_usd is not None and results
+        else None
+    )
 
     return {
         "schema_version": 1,
