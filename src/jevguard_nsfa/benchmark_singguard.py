@@ -276,13 +276,14 @@ def _infer_batch(
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
-    side = Side(args.side)
+    benchmark_side = Side.RESPONSE if args.benchmark == "response" else Side.QUERY
     languages = set(args.language) if args.language else None
     rows = list(
         iter_huggingface_rows(
             dataset_name=args.dataset,
             split=args.split,
-            side=side,
+            benchmark=args.benchmark,
+            side=benchmark_side,
             languages=languages,
             id_contains=args.id_contains,
             limit=args.limit,
@@ -390,7 +391,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "dataset": {
             "name": args.dataset,
             "split": args.split,
-            "side": args.side,
+            "benchmark": args.benchmark,
             "languages": sorted(languages) if languages else None,
             "id_contains": args.id_contains,
             "seed": args.seed,
@@ -432,7 +433,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", default="inclusionAI/NSFA_Benchmarks")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--side", choices=["query", "response"], required=True)
+    parser.add_argument(
+        "--benchmark",
+        choices=["query", "response", "cross-source-query"],
+        default="query",
+    )
     parser.add_argument("--language", action="append")
     parser.add_argument("--id-contains", default=None)
     parser.add_argument("--limit", type=int, default=1000)
