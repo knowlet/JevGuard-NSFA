@@ -56,13 +56,12 @@ async def _run_one(
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
-    side = None if args.side == "auto" else Side(args.side)
     languages = set(args.language) if args.language else None
     rows = list(
         iter_huggingface_rows(
             dataset_name=args.dataset,
             split=args.split,
-            side=side,
+            benchmark=args.benchmark,
             languages=languages,
             id_contains=args.id_contains,
             limit=args.limit,
@@ -127,7 +126,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "dataset": {
             "name": args.dataset,
             "split": args.split,
-            "side": args.side,
+            "benchmark": args.benchmark,
             "languages": sorted(languages) if languages else None,
             "id_contains": args.id_contains,
             "seed": args.seed,
@@ -169,7 +168,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--side", choices=["auto", "query", "response"], default="auto")
+    parser.add_argument(
+        "--benchmark",
+        choices=["query", "response", "cross-source-query"],
+        default="query",
+    )
     parser.add_argument("--language", action="append", help="Language code; repeat to include multiple languages")
     parser.add_argument("--id-contains", default=None, help="Optional substring filter for dataset row ids")
     parser.add_argument("--limit", type=int, default=1000)
