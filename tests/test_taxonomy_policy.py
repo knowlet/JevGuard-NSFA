@@ -26,3 +26,35 @@ def test_domain_threshold_override() -> None:
     policy = ThresholdPolicy(default_threshold=0.5, domain_thresholds={"a": 0.8})
     assert not policy.is_unsafe({"a": 0.7})
     assert policy.is_unsafe({"b": 0.7})
+
+
+def test_zero_review_margin_agrees_with_binary_label_on_threshold_equality() -> None:
+    policy = ThresholdPolicy(default_threshold=0.5, review_margin=0.0)
+    on_threshold = {"prompt_injection_and_jailbreak": 0.5}
+    assert not policy.is_unsafe(on_threshold)
+    assert policy.decision(on_threshold) is Decision.ALLOW
+    assert policy.decision({"prompt_injection_and_jailbreak": 0.25}) is Decision.ALLOW
+    assert policy.decision({"prompt_injection_and_jailbreak": 0.75}) is Decision.BLOCK
+
+
+def test_zero_review_margin_respects_domain_thresholds() -> None:
+    policy = ThresholdPolicy(default_threshold=0.5, domain_thresholds={"a": 0.75}, review_margin=0.0)
+    assert not policy.is_unsafe({"a": 0.75})
+    assert policy.decision({"a": 0.75}) is Decision.ALLOW
+    assert policy.is_unsafe({"b": 0.75})
+    assert policy.decision({"b": 0.75}) is Decision.BLOCK
+
+
+def test_zero_review_margin_never_returns_review() -> None:
+    policy = ThresholdPolicy(default_threshold=0.5, review_margin=0.0)
+    for score in (0.0, 0.25, 0.5, 0.75, 1.0):
+        scores = {"risk": score}
+        expected = Decision.BLOCK if policy.is_unsafe(scores) else Decision.ALLOW
+        assert policy.decision(scores) is expected
+
+
+def test_positive_review_margin_keeps_band_boundaries() -> None:
+    policy = ThresholdPolicy(default_threshold=0.5, review_margin=0.25)
+    assert policy.decision({"risk": 0.25}) is Decision.ALLOW
+    assert policy.decision({"risk": 0.375}) is Decision.REVIEW
+    assert policy.decision({"risk": 0.75}) is Decision.BLOCK

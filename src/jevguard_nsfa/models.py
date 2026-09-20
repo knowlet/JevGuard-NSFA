@@ -25,6 +25,10 @@ class ThresholdPolicy:
     The binary benchmark label always uses each domain's threshold directly.
     The review band is an operational policy around those thresholds and is not
     used when computing apples-to-apples benchmark F1.
+
+    A zero review margin disables the review band entirely, so decision() then
+    agrees with is_unsafe() on every score, including a score that equals its
+    threshold.
     """
 
     default_threshold: float = 0.5
@@ -47,6 +51,12 @@ class ThresholdPolicy:
     def decision(self, scores: Mapping[str, float]) -> Decision:
         if not scores:
             raise ValueError("scores must not be empty")
+        if self.review_margin == 0:
+            # Without a review band there is no ambiguity to resolve, so the
+            # operational decision must agree exactly with the binary label --
+            # including a score that sits exactly on its threshold, where the
+            # review band would otherwise turn a "safe" label into a block.
+            return Decision.BLOCK if self.is_unsafe(scores) else Decision.ALLOW
         best_margin = max(score - self.threshold_for(domain) for domain, score in scores.items())
         if best_margin >= self.review_margin:
             return Decision.BLOCK
