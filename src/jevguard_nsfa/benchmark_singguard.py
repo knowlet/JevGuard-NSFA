@@ -7,7 +7,8 @@ import copy
 import hashlib
 import inspect
 import json
-from collections.abc import Iterable, Sequence
+import sys
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -16,6 +17,7 @@ from typing import Any
 from .dataset import BenchmarkRow, canonical_domain, iter_huggingface_rows
 from .metrics import evaluate_guard_results, latency_summary
 from .models import GuardResult, Side, ThresholdPolicy
+from .taxonomy import domains_for
 
 
 def _sha256_lines(lines: Iterable[str]) -> str:
@@ -27,9 +29,23 @@ def _sha256_lines(lines: Iterable[str]) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+def _sample_identity(row: BenchmarkRow) -> str:
+    """Canonical JSON identity of one sample, byte-identical to ``benchmark_jev._sample_identity``.
+
+    The fingerprint must cover everything that changes what was measured, not just the row
+    id: two runs over the same ids with different texts, labels, sides, L1 domains or
+    languages are different selections and must not be reported as aligned.
+    """
+    return json.dumps(
+        [row.id, row.text, row.label, row.side.value, list(row.domains), row.lang],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _rows_fingerprint(rows: Sequence[BenchmarkRow]) -> str:
     """Identify the attempted sample selection in emitted order."""
-    return _sha256_lines(f"{row.id}|{row.label}|{row.side.value}|{row.lang}" for row in rows)
+    return _sha256_lines(_sample_identity(row) for row in rows)
 
 
 def _rows_id_digest(rows: Sequence[BenchmarkRow]) -> str:
@@ -306,7 +322,7 @@ def _prepare_head_runner(heads: dict[str, dict[str, Any]], task: str, device: st
     `device` mirrors the signature of `_load_heads`, which has already materialised every
     head on it; the stacked parameters/buffers inherit that placement.
     """
-    matching = {name: info for name, info in heads.items() if info["task"] == task}
+    matching = _heads_for_task(heads, task)
     if not matching:
         raise RuntimeError(f"No classification heads found for task={task!r}")
     names = tuple(sorted(matching))
@@ -328,6 +344,60 @@ def _runner_for_side(runners: dict[str, _HeadRunner], side: Side) -> _HeadRunner
         return runners[side.value]
     except KeyError as exc:
         raise RuntimeError(f"No classification heads found for task={side.value!r}") from exc
+
+
+def _heads_for_task(heads: Mapping[str, dict[str, Any]], task: str) -> dict[str, dict[str, Any]]:
+    """The heads ``_prepare_head_runner`` would stack for ``task`` (same filter, same order)."""
+    return {name: info for name, info in heads.items() if info["task"] == task}
+
+
+def _head_manifest(side: Side, heads: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
+    """Describe the head set that will actually run for ``side``.
+
+    ``--heads-dir`` is a plain directory anyone can repack, and a single missing ``.pth``
+    used to degrade silently: the domain never ran, yet ``metrics.evaluate_guard_results``
+    reported it as a ``0.0`` risk probability (``fn == positives``). The manifest is the
+    source of truth for the completeness gate and is always recorded in the report.
+    """
+    expected = tuple(domain.id for domain in domains_for(side))
+    loaded = tuple(sorted(_heads_for_task(heads, side.value)))
+    missing = tuple(sorted(set(expected) - set(loaded)))
+    unexpected = tuple(sorted(set(loaded) - set(expected)))
+    return {
+        "side": side.value,
+        "expected_domains": list(expected),
+        "loaded_domains": list(loaded),
+        "missing_domains": list(missing),
+        "unexpected_domains": list(unexpected),
+        "complete": not missing and not unexpected,
+        "head_count": len(loaded),
+    }
+
+
+def _require_complete_head_set(
+    manifest: Mapping[str, Any],
+    *,
+    side: Side,
+    heads_dir: str | None,
+    allow_partial: bool,
+) -> None:
+    """Refuse to benchmark a partial head set unless the caller explicitly opted in.
+
+    Runs before warmup and before any measurement, so an incomplete set can never produce a
+    report that looks like a complete NSFA baseline.
+    """
+    if manifest["complete"] or allow_partial:
+        return
+    raise RuntimeError(
+        f"Incomplete SingGuard classification-head set for the {side.value}-side benchmark: "
+        f"missing domains {manifest['missing_domains']!r}, unexpected domains "
+        f"{manifest['unexpected_domains']!r} (loaded: {manifest['loaded_domains']!r}). "
+        f"Point --heads-dir at a directory holding every NSFA Level-1 {side.value}-side head "
+        f"({manifest['expected_domains']!r}); currently checked {heads_dir or 'the model snapshot'!r}. "
+        "A domain without a head would be scored as a 0.0 risk probability, so the run is "
+        "refused instead of silently reported. Pass --allow-partial-heads to measure a "
+        "partial head set as an explicitly non-baseline run."
+    )
 
 
 def _infer_batch(
@@ -380,6 +450,8 @@ def _infer_batch(
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_side = Side.RESPONSE if args.benchmark == "response" else Side.QUERY
+    dataset_revision = getattr(args, "dataset_revision", None)
+    allow_partial_heads = bool(getattr(args, "allow_partial_heads", False))
     languages = set(args.language) if args.language else None
     rows = list(
         iter_huggingface_rows(
@@ -391,6 +463,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             id_contains=args.id_contains,
             limit=args.limit,
             seed=args.seed,
+            revision=dataset_revision,
         )
     )
     if not rows:
@@ -401,6 +474,24 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("CUDA is required for the default original SingGuard realtime benchmark")
 
     load_started = perf_counter()
+    # The head set is validated before the tokenizer/model load and, crucially, before warmup
+    # and any measurement: a partial set fails the run instead of silently scoring the missing
+    # domains as 0.0 risk probabilities.
+    heads = _load_heads(args.model, args.heads_dir, args.device)
+    head_manifest = _head_manifest(benchmark_side, heads)
+    _require_complete_head_set(
+        head_manifest,
+        side=benchmark_side,
+        heads_dir=args.heads_dir,
+        allow_partial=allow_partial_heads,
+    )
+    if not head_manifest["loaded_domains"]:
+        raise RuntimeError(
+            f"No {benchmark_side.value}-side SingGuard classification heads were loaded from "
+            f"{args.heads_dir or args.model!r}: expected {head_manifest['expected_domains']!r}. "
+            "Point --heads-dir at the NSFA classification-head directory."
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, truncation_side="left", use_fast=True)
     llm = _make_llm(
         args.model,
@@ -413,12 +504,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         int(llm.llm_engine.model_config.max_model_len),
         args.max_tokens,
     )
-    heads = _load_heads(args.model, args.heads_dir, args.device)
     runner_started = perf_counter()
-    runners = {
-        task: _prepare_head_runner(heads, task, args.device)
-        for task in sorted({info["task"] for info in heads.values()})
-    }
+    # Only the benchmarked side is stacked. The unused side's heads cannot influence this
+    # run's numbers, so demanding them would reject a perfectly valid single-side head set.
+    runners = {benchmark_side.value: _prepare_head_runner(heads, benchmark_side.value, args.device)}
     classification_head_runner_seconds = perf_counter() - runner_started
     model_load_seconds = perf_counter() - load_started
 
@@ -475,7 +564,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             successful_rows.append(row)
     wall_seconds = perf_counter() - started
 
-    quality = evaluate_guard_results(rows, results, threshold=args.threshold)
+    if head_manifest["complete"]:
+        quality = evaluate_guard_results(rows, results, threshold=args.threshold)
+    else:
+        # A partial head set has no score for the missing domains, and
+        # metrics.evaluate_guard_results refuses to invent one -- a head that never ran is not
+        # a 0.0 risk probability. The measurement itself is still reported, without quality.
+        quality = None
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else args.device
     steady_cost = (
         wall_seconds * args.gpu_hourly_usd / 3600.0
@@ -510,6 +605,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "languages": sorted(languages) if languages else None,
             "id_contains": args.id_contains,
             "seed": args.seed,
+            "revision": dataset_revision,
             "fingerprint": _rows_fingerprint(rows),
         },
         "parameters": {
@@ -526,9 +622,27 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "attempted": len(rows),
             "successful": len(results),
             "failed": 0,
+            # Diagnostic only, and deliberately id-only: the comparator must gate on the
+            # content-covering fingerprints below, never on this digest.
             "attempted_ids_sha256": _rows_id_digest(rows),
-            "successful_ids_sha256": _rows_id_digest(successful_rows),
+            # Covers the rows that actually produced a scored result; SingGuard scores every
+            # attempted row or fails the run, so this equals dataset.fingerprint today.
+            "successful_sha256": _rows_fingerprint(successful_rows),
         },
+        "head_manifest": head_manifest,
+        "baseline_complete": head_manifest["complete"],
+        "baseline_note": (
+            "Complete NSFA Level-1 classification-head set for the benchmarked side."
+            if head_manifest["complete"]
+            else (
+                "Partial classification-head set (--allow-partial-heads): missing "
+                f"{head_manifest['missing_domains']!r} and unexpected "
+                f"{head_manifest['unexpected_domains']!r}. This run is NOT a complete NSFA "
+                "baseline and its quality numbers are not comparable to a full head set; "
+                "quality is reported as null because a head that never ran is not a 0.0 risk "
+                "probability."
+            )
+        ),
         "quality": quality,
         "cold_start": {
             "model_and_head_load_seconds": model_load_seconds,
@@ -570,6 +684,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", default="inclusionAI/NSFA_Benchmarks")
     parser.add_argument("--split", default="train")
     parser.add_argument(
+        "--dataset-revision",
+        default=None,
+        help="Dataset revision (commit/tag) to load; recorded as dataset.revision",
+    )
+    parser.add_argument(
         "--benchmark",
         choices=["query", "response", "cross-source-query"],
         default="query",
@@ -580,6 +699,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", default="inclusionAI/SingGuard-NSFA-0.8B")
     parser.add_argument("--heads-dir", default=None)
+    parser.add_argument(
+        "--allow-partial-heads",
+        action="store_true",
+        help=(
+            "Measure a partial classification-head set. The run is reported with "
+            "head_manifest.complete=false and baseline_complete=false instead of pretending "
+            "to be a complete NSFA baseline"
+        ),
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--review-margin", type=float, default=0.10)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -599,6 +727,8 @@ def main_from_args(args: argparse.Namespace) -> int:
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
     report = run_benchmark(args)
+    if not report.get("baseline_complete", True):
+        print(f"WARNING: {report.get('baseline_note', 'incomplete baseline')}", file=sys.stderr)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rendered = json.dumps(report, indent=2, sort_keys=True, allow_nan=False)
     args.output.write_text(rendered, encoding="utf-8")
