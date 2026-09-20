@@ -16,8 +16,12 @@ class BenchmarkRow:
     text: str
     label: int
     side: Side
-    domain: str | None
+    domains: tuple[str, ...]
     lang: str
+
+    @property
+    def domain(self) -> str | None:
+        return self.domains[0] if self.domains else None
 
 
 def _slug(value: str) -> str:
@@ -45,23 +49,40 @@ _RESPONSE_IDS = {domain.id for domain in DOMAINS if domain.side is Side.RESPONSE
 
 
 def canonical_domain(value: Any) -> str | None:
+    domains = canonical_domains(value)
+    return domains[0] if domains else None
+
+
+def canonical_domains(value: Any) -> tuple[str, ...]:
     if value is None:
-        return None
-    key = _slug(str(value))
-    if not key or key in {"no_risk", "safe", "none", "nan"}:
-        return None
-    return _DOMAIN_ALIASES.get(key)
+        return ()
+    raw = str(value).strip()
+    if not raw:
+        return ()
+    resolved: list[str] = []
+    for part in raw.split(";"):
+        key = _slug(part)
+        if not key or key in {"no_risk", "safe", "none", "nan"}:
+            continue
+        domain = _DOMAIN_ALIASES.get(key)
+        if domain is None:
+            raise ValueError(f"Unknown NSFA L1 risk domain: {part!r}")
+        if domain not in resolved:
+            resolved.append(domain)
+    return tuple(resolved)
 
 
 def infer_side(row: dict[str, Any], forced: Side | None = None) -> Side:
     if forced is not None:
         return forced
 
-    domain = canonical_domain(row.get("L1-Risk") or row.get("l1_risk") or row.get("domain"))
-    if domain in _QUERY_IDS:
+    domains = canonical_domains(row.get("L1-Risk") or row.get("l1_risk") or row.get("domain"))
+    if domains and all(domain in _QUERY_IDS for domain in domains):
         return Side.QUERY
-    if domain in _RESPONSE_IDS:
+    if domains and all(domain in _RESPONSE_IDS for domain in domains):
         return Side.RESPONSE
+    if domains:
+        raise ValueError(f"Row mixes query-side and response-side L1 domains: {domains!r}")
 
     explicit = str(row.get("side", "")).strip().lower()
     if explicit in {"query", "input"}:
@@ -85,13 +106,13 @@ def row_from_mapping(row: dict[str, Any], forced_side: Side | None = None) -> Be
     label = int(row["label"])
     if label not in (0, 1):
         raise ValueError(f"Expected binary label 0/1, got {label!r}")
-    domain = canonical_domain(row.get("L1-Risk") or row.get("l1_risk") or row.get("domain"))
+    domains = canonical_domains(row.get("L1-Risk") or row.get("l1_risk") or row.get("domain"))
     return BenchmarkRow(
         id=str(row.get("id", "")),
         text=str(row["text"]),
         label=label,
         side=infer_side(row, forced_side),
-        domain=domain,
+        domains=domains,
         lang=str(row.get("lang", "")),
     )
 
