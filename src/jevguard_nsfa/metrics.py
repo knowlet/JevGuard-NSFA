@@ -104,6 +104,8 @@ def latency_summary(latencies_ms: Sequence[float]) -> dict[str, float]:
 def evaluate_guard_results(
     rows: Sequence[BenchmarkRow],
     results: Sequence[GuardResult],
+    *,
+    threshold: float = 0.5,
 ) -> dict[str, object]:
     if len(rows) != len(results):
         raise ValueError("rows and results must have the same length")
@@ -121,7 +123,7 @@ def evaluate_guard_results(
     per_domain: dict[str, Mapping[str, float | int]] = {}
     for domain in domains:
         domain_labels = [int(row.label == 1 and row.domain == domain) for row in rows]
-        domain_guesses = [result.scores.get(domain, 0.0) >= 0.5 for result in results]
+        domain_guesses = [result.scores.get(domain, 0.0) >= threshold for result in results]
         domain_probs = [result.scores.get(domain, 0.0) for result in results]
         per_domain[domain] = binary_metrics(domain_labels, domain_guesses, domain_probs).to_dict()
 
