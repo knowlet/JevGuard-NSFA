@@ -125,7 +125,7 @@ def evaluate_guard_results(
     per_domain: dict[str, Mapping[str, float | int]] = {}
     for domain in domains:
         domain_labels = [int(row.label == 1 and domain in row.domains) for row in rows]
-        domain_guesses = [result.scores.get(domain, 0.0) >= threshold for result in results]
+        domain_guesses = [result.scores.get(domain, 0.0) > threshold for result in results]
         domain_probs = [result.scores.get(domain, 0.0) for result in results]
         per_domain[domain] = binary_metrics(domain_labels, domain_guesses, domain_probs).to_dict()
 
