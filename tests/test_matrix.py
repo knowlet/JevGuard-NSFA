@@ -18,7 +18,7 @@ def _report(*, fingerprint: str = "a" * 64, revision: str | None = "dataset-rev"
         },
         "parameters": parameters,
         "latency_scope": "request",
-        "samples": {"failed": 0},
+        "samples": {"successful": 100, "failed": 0, "successful_sha256": fingerprint},
         "quality": {
             "binary": {
                 "f1": 0.8,
@@ -69,3 +69,14 @@ def test_render_markdown_contains_all_engine_labels() -> None:
     rendered = render_markdown(reports)
     assert "| Metric | Jev | Kev | Laya |" in rendered
     assert "Quality comparable: **true**" in rendered
+
+
+def test_successful_subset_mismatch_withholds_quality() -> None:
+    left = _report()
+    right = _report()
+    right["samples"]["successful"] = 99
+    right["samples"]["successful_sha256"] = "c" * 64
+    result = alignment({"left": left, "right": right})
+    assert result["quality_comparable"] is False
+    assert result["checks"]["samples.successful"] is False
+    assert result["checks"]["samples.successful_sha256"] is False
