@@ -241,7 +241,50 @@ loses the latency delta. Per-engine values are always printed; a withheld delta
 renders as n/a, the reason is stated in the report, and a warning is printed to
 stdout.
 
-本機 NVIDIA GB10 的完整實測、資料品質掃描與 JevGuard 對 SingGuard 比較，請參考 [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md)。
+本機 NVIDIA GB10 的既有實測、資料品質掃描與 JevGuard 對 SingGuard 比較，請參考 [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md)。
+
+下一輪擴大樣本與多模型比較（Kev、Laya、Decider-2B、Qwen RLCD）的固定測試矩陣、runtime adapter 與重現命令，請參考 [BENCHMARK_MATRIX.md](BENCHMARK_MATRIX.md)。
+
+### Expanded benchmark engines
+
+The generic runner normalizes open decision engines to the same NSFA Level-1 probability vector:
+
+    # Kev or Decider: serve the upstream TypeSafe-compatible endpoint first.
+    jevguard-nsfa bench-open \
+      --backend systemone-http \
+      --engine kev-4b \
+      --base-url http://127.0.0.1:8009 \
+      --benchmark cross-source-query \
+      --limit 1000
+
+    # Laya: routed English/multilingual checkpoints.
+    jevguard-nsfa bench-open \
+      --backend laya \
+      --engine laya-routed \
+      --model routed \
+      --device cuda \
+      --benchmark cross-source-query \
+      --limit 1000
+
+    # Qwen RLCD: upstream /api/run-parallel server.
+    jevguard-nsfa bench-open \
+      --backend rlcd-http \
+      --engine qwen-2.5-1b-rlcd \
+      --base-url http://127.0.0.1:8000 \
+      --benchmark query \
+      --limit 1000
+
+Use `--full` on `bench-jev`, `bench-singguard`, or `bench-open` to score the entire selected subset. New reports include Brier score, log loss, and 10-bin expected calibration error in addition to the existing classification metrics.
+
+Render an aligned N-way matrix with:
+
+    jevguard-nsfa matrix \
+      --report Jev=benchmark-results/jev.json \
+      --report SingGuard=benchmark-results/singguard.json \
+      --report Kev=benchmark-results/kev.json \
+      --report Laya=benchmark-results/laya.json \
+      --report Decider=benchmark-results/decider.json \
+      --report RLCD=benchmark-results/rlcd.json
 
 ## Fair-comparison rules
 
@@ -282,6 +325,7 @@ Next:
 - Level-2/Level-3 diagnostic registry
 - threshold calibration split and reliability diagrams
 - repeated-run confidence intervals
+- expanded Kev/Laya/Decider/RLCD NSFA matrix with 500/1,000/full-set runs
 - trajectory/tool-state extensions beyond the upstream single-turn NSFA scope
 - optional served SingGuard endpoint mode to compare network-to-network latency
 
@@ -291,5 +335,9 @@ Next:
 - NSFA benchmark: https://huggingface.co/datasets/inclusionAI/NSFA_Benchmarks
 - SingGuard-NSFA models: https://huggingface.co/collections/inclusionAI/singguard-nsfa
 - TypeSafe SDK: https://github.com/typesafe-ai/typesafe-sdk-python
+- Kev: https://github.com/jaredpalmer/kev
+- Laya: https://github.com/NandhaKishorM/laya
+- Decider-2B: https://huggingface.co/Mapika/decider-2b
+- Qwen-2.5-1B-RLCD: https://huggingface.co/harshatheg/Qwen-2.5-1B-RLCD
 
 This repository is an independent experiment and is not an official InclusionAI, Ant Group, or TypeSafe project.
