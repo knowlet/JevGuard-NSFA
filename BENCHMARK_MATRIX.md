@@ -179,7 +179,7 @@ Render any number of aligned reports:
       --report RLCD=benchmark-results/rlcd-cross-1000.json \
       --output benchmark-results/cross-1000-matrix.md
 
-The matrix reports whether quality and latency are actually comparable. Quality requires matching benchmark, content fingerprint, threshold, and non-conflicting pinned dataset revisions. Latency additionally requires request-level timing and no batch size greater than one.
+The matrix reports whether quality and latency are actually comparable. Quality requires matching benchmark, attempted content fingerprint, threshold, non-conflicting pinned dataset revisions, successful sample count, and successful-sample digest. Latency additionally requires request-level timing and no batch size greater than one.
 
 A matching F1 table does not by itself make latency an apples-to-apples model comparison: managed API, in-process Python, local HTTP, local GPU classification, and Apple MLX include different runtime boundaries.
 
