@@ -21,6 +21,8 @@ _METRICS: tuple[tuple[str, str, int], ...] = (
     ("Precision", "quality.binary.precision", 4),
     ("Recall", "quality.binary.recall", 4),
     ("Brier", "quality.binary.brier", 4),
+    ("Log loss", "quality.binary.log_loss", 4),
+    ("ECE", "quality.binary.expected_calibration_error", 4),
     ("Positive L1 accuracy", "quality.positive_domain_accuracy", 4),
     ("Latency p50 (ms)", "latency_ms.p50", 2),
     ("Latency p95 (ms)", "latency_ms.p95", 2),
