@@ -125,8 +125,97 @@ PYTHONPATH=src .venv/bin/python scripts/validate_benchmark_results.py \
 - SingGuard 成本使用 $1.50/GPU-hour 情境假設；JevGuard cost 使用報告中的 API input price，不包含所有可能的服務費用。
 
 
+## Full-set benchmark round (2026-09-21)
+
+第二輪把樣本數拉到完整資料集：query 63,431、response 29,972、cross-source-query 3,435，三個 subset 都在固定 dataset revision `54b390c5b9c26ec40ce7f660e278d909f4dad8dc` 上執行。上方 100 筆的結果保留為歷史驗證，這一輪才是目前的主要結論。
+
+### Protocol
+
+- JevGuard：managed TypeSafe API，報告解析為 `jev-1.13.0`；seed 42、threshold 0.5、concurrency 8、rpm 900、每列 attempt budget 180 秒、retries 2。latency 是 managed API end-to-end 時間，含網路與服務端排隊，部署邊界和本機推論不同。
+- SingGuard-NSFA 0.8B：本機 NVIDIA GB10；model revision `455a72e4331b9ef37ae49154eff2a3715642c17a`；batch size 1、warmup 8、max_tokens 1024、gpu_memory_utilization 0.2；完整 head set（query 與 cross-source 5 個、response 2 個）。
+- Decider-2b：Mapika/decider-2b v10，snapshot `b37f7e1ba3fbc9238004cf531fabbee2619973fd`，由 repo 自帶的 `decider.serve` 在容器內提供 `POST /v1/systemone`，再由 `bench-open --backend systemone-http` 評分。
+- 兩邊使用相同的 subset 檔與 shuffled seed 42，因此 `dataset.fingerprint` 一致。
+
+### 全量結果
+
+| Benchmark | Engine | Attempted | Successful | Failed | F1 | Accuracy | Precision | Recall | Brier | Log loss | ECE | Positive L1 acc | p50 ms | p95 ms | Req/s | Cost / 1k |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| query | JevGuard | 63,431 | 63,429 | 2 | 0.9229 | 0.9299 | 0.9444 | 0.9022 | 0.0541 | 0.1957 | 0.0579 | 0.8499 | 293.00 | 977.16 | 12.32 | $0.039817 |
+| query | SingGuard | 63,431 | 63,431 | 0 | 0.9402 | 0.9424 | 0.9083 | 0.9743 | 0.0469 | 0.1887 | 0.0315 | 0.9377 | 57.98 | 71.31 | 17.27 | $0.024132 |
+| response | JevGuard | 未執行 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| response | SingGuard | 29,972 | 29,972 | 0 | 0.9780 | 0.9788 | 0.9697 | 0.9866 | 0.0188 | 0.0902 | 0.0148 | 0.9977 | 50.89 | 73.89 | 16.62 | $0.025071 |
+| cross-source-query | JevGuard | 3,435 | 3,435 | 0 | 0.9094 | 0.8789 | 0.9174 | 0.9015 | 0.0878 | 0.2940 | 0.0567 | 0.7896 | 299.36 | 981.30 | 12.16 | $0.046027 |
+| cross-source-query | SingGuard | 3,435 | 3,435 | 0 | 0.8804 | 0.8210 | 0.8008 | 0.9775 | 0.1361 | 0.4723 | 0.1131 | 0.7089 | 74.04 | 96.96 | 13.07 | $0.031885 |
+| cross-source-query | Decider-2b | 3,435 | 3,435 | 0 | 0.7933 | 0.7397 | 0.8533 | 0.7413 | 0.1741 | 0.5219 | 0.1141 | 0.6704 | 585.91 | 1,372.19 | 1.58 | $0.264190 |
+
+JevGuard 的 cost 由回傳的 input token 數推得（$0.042 / 1M input tokens）；SingGuard 與 Decider 的成本以明示的 $1.50 / GPU-hour 情境換算。兩者不是同一種計價，不應直接相加或相減。
+
+### Cross-source-query：完整配對 delta
+
+cross-source-query 是三個 subset 中唯一兩邊都零失敗的一組，因此 comparator 輸出完整 delta，alignment 全部為 ok：
+
+| Metric | JevGuard-NSFA | SingGuard-NSFA | Jev - SingGuard |
+|---|---:|---:|---:|
+| Binary F1 | 0.9094 | 0.8804 | +0.0290 |
+| Accuracy | 0.8789 | 0.8210 | +0.0579 |
+| Precision | 0.9174 | 0.8008 | +0.1166 |
+| Recall | 0.9015 | 0.9775 | -0.0760 |
+| Brier score | 0.0878 | 0.1361 | -0.0482 |
+| Log loss | 0.2940 | 0.4723 | -0.1783 |
+| Expected calibration error | 0.0567 | 0.1131 | -0.0564 |
+| Positive L1 accuracy | 0.7896 | 0.7089 | +0.0808 |
+| Latency p50 (ms) | 299.36 | 74.04 | +225.32 |
+| Latency p95 (ms) | 981.30 | 96.96 | +884.34 |
+
+JevGuard 在 F1 與 accuracy 領先，並有較低的 Brier score、log loss 與 ECE；SingGuard 則在高 recall 與延遲上領先。兩個模型相差 0.029 F1，比 100 筆樣本時的 0.0346 略窄，方向一致。
+
+### Query：2 筆 operational failure
+
+JevGuard 63,429/63,431 成功，2 筆 TypeSafe timeout 被記錄成 failure，沒有被當成 safe；SingGuard 63,431/63,431。因為成功樣本集合不同，comparator 依 alignment 規則保留 quality delta，只輸出 per-engine 數值。
+
+已觀測到的差距是 SingGuard F1 高 0.0173、accuracy 高 0.0125，比 100 筆樣本時的 0.1110 小了一個量級，說明 100 筆的差距主要來自抽樣波動。分項上 JevGuard 在 prompt injection 的 recall（0.760 對 0.941）落後，在 resource abuse 的 F1（0.671 對 0.588）領先，而 SingGuard 的 positive L1 accuracy 0.9377 明顯高於 JevGuard 的 0.8499。
+
+### Response：只有 SingGuard 全量
+
+SingGuard response 全量完成（29,972/29,972、0 失敗、F1 0.9780）。JevGuard response 全量沒有結果：執行期間 TypeSafe API 回傳 HTTP 402 `Your organization has no available TypeSafe API credits`，同時讓 63,431 筆的 query 重跑在後段累積 12,242 筆失敗。該失敗報告改名為 `benchmark-results/jev-query-full-credit-exhausted-run.json`，不列入結果表。補足額度後可重跑：
+
+    jevguard-nsfa bench-jev --benchmark response \
+      --dataset-revision 54b390c5b9c26ec40ce7f660e278d909f4dad8dc \
+      --full --timeout 180 --concurrency 8 --rpm 900 \
+      --output benchmark-results/jev-response-full-fixed.json
+
+### Decider-2b：新比較對象的真實 runtime 結果
+
+Decider-2b 的 adapter 先前只有 fake-runtime unit test；這一輪讓它在真實 server 上跑完 3,435 筆，因此 `systemone-http` 路徑有真實 runtime 證據。它的結果明顯落後兩者：F1 0.7933、accuracy 0.7397，比 SingGuard 低約 0.087 F1，比 JevGuard 低約 0.116 F1。
+
+這符合它的定位。Decider-2b 是通用 typed-decision 模型，沒有針對 NSFA taxonomy 訓練，介面是每個問題一個 noul 布林值。分項上資源濫用 F1 為 0（2 個正例全部漏判），敏感資訊竊取 recall 只有 0.252，prompt injection 的 precision 0.517、recall 0.778 是相對較好的項目。它的吞吐約 1.58 req/s，因為容器內沒有 flash-linear-attention，linear-attention 層走 torch reference 路徑，latency 因此在不同的部署邊界上。
+
+### 驗證
+
+- 六份納入結果表的報告都通過 `scripts/validate_benchmark_results.py`：TP/FP/TN/FN 可重新推導 accuracy、precision、recall、F1 並與 JSON 一致；confusion matrix 總和等於 successful；attempted = successful + failed。
+- SingGuard 三份報告的 `head_manifest.complete` 與 `baseline_complete` 都是 true，`model_revision.resolved` 等於 `455a72e4331b9ef37ae49154eff2a3715642c17a`。
+- cross-source-query 的 JevGuard、SingGuard、Decider 報告 `dataset.fingerprint` 與 `samples.successful_sha256` 相同，`matrix` 輸出 quality comparable = true、latency comparable = true。
+- query 的 JevGuard 報告 `successful_sha256` 與其他報告不同（2 筆失敗），所以該組 delta 由 comparator 保留。
+- 重跑證據：timeout 30 與 timeout 60 的 cross-source 全量各出現 1 筆 timeout；改成每列 180 秒 budget 後同一 subset 達到 3,435/3,435。
+
+可重現命令：
+
+    PYTHONPATH=src .venv/bin/python scripts/validate_benchmark_results.py \
+      --report benchmark-results/jev-cross-source-query-full-fixed-timeout180.json \
+      --report benchmark-results/jev-query-full-fixed.json \
+      --report benchmark-results/singguard-cross-source-query-full-fixed-batch1-rerun.json \
+      --report benchmark-results/singguard-query-full-fixed-batch1.json \
+      --report benchmark-results/singguard-response-full-fixed-batch1.json \
+      --report benchmark-results/decider-2b-cross-source-query-full-fixed.json
+
+    PYTHONPATH=src .venv/bin/python -m jevguard_nsfa.cli matrix \
+      --report Jev=benchmark-results/jev-cross-source-query-full-fixed-timeout180.json \
+      --report SingGuard=benchmark-results/singguard-cross-source-query-full-fixed-batch1-rerun.json \
+      --report Decider=benchmark-results/decider-2b-cross-source-query-full-fixed.json \
+      --output benchmark-results/matrix-cross-source-query-full.md
+
 ## Expanded benchmark follow-up
 
 The 100-row measurements above predate the expanded benchmark schema, so they do not contain the newly added log-loss or expected-calibration-error fields. Do not backfill those values from aggregate confusion matrices.
 
-The next validation round is specified in [BENCHMARK_MATRIX.md](BENCHMARK_MATRIX.md): 500/1,000-row paired runs, a mandatory full 3,435-row cross-source-query run, language slices, and Kev/Laya/Decider/RLCD comparison adapters. New model results should only be added here after their pinned runtimes actually execute and their report fingerprints pass independent validation.
+The first full-set round is recorded above. Still open: Kev, Laya and Qwen-2.5-1B-RLCD need a pinned runtime before any accuracy number can be claimed for them; the English-only slices (`--language en`) and the 500/1,000-row intermediate stages have not been rerun because the full sets already cover the same sample content; and the JevGuard response full set needs API credits before it can run.

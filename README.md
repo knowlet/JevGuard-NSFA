@@ -274,7 +274,7 @@ The generic runner normalizes open decision engines to the same NSFA Level-1 pro
       --benchmark query \
       --limit 1000
 
-Use `--full` on `bench-jev`, `bench-singguard`, or `bench-open` to score the entire selected subset. New reports include Brier score, log loss, and 10-bin expected calibration error in addition to the existing classification metrics.
+Use `--full` on `bench-jev`, `bench-singguard`, or `bench-open` to score the entire selected subset. New reports include Brier score, log loss, and 10-bin expected calibration error in addition to the existing classification metrics. The first full-set round (query 63,431, response 29,972, cross-source-query 3,435) is recorded in [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md); it includes a real Decider-2b cross-source run and the TypeSafe credit limit that blocked the JevGuard response full set.
 
 Render an aligned N-way matrix with:
 
@@ -325,7 +325,7 @@ Next:
 - Level-2/Level-3 diagnostic registry
 - threshold calibration split and reliability diagrams
 - repeated-run confidence intervals
-- expanded Kev/Laya/Decider/RLCD NSFA matrix with 500/1,000/full-set runs
+- expanded NSFA matrix: JevGuard/SingGuard/Decider-2b full sets executed; Kev/Laya/RLCD runtimes and English slices still pending
 - trajectory/tool-state extensions beyond the upstream single-turn NSFA scope
 - optional served SingGuard endpoint mode to compare network-to-network latency
 
