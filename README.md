@@ -101,6 +101,12 @@ JevGuard loads these files separately rather than relying on the concatenated tr
 
 The adapter also preserves semicolon-separated multi-label Level-1 ground truth.
 
+Validate the complete cached dataset independently of model scoring:
+
+    PYTHONPATH=src python scripts/validate_benchmark_data.py \
+      --dataset-revision <commit> \
+      --output benchmark-results/data-quality.json
+
 ## Benchmark JevGuard
 
 Example, 1,000 query samples:
@@ -234,6 +240,8 @@ throughput run with a large batch size still reports its quality delta and only
 loses the latency delta. Per-engine values are always printed; a withheld delta
 renders as n/a, the reason is stated in the report, and a warning is printed to
 stdout.
+
+本機 NVIDIA GB10 的完整實測、資料品質掃描與 JevGuard 對 SingGuard 比較，請參考 [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md)。
 
 ## Fair-comparison rules
 

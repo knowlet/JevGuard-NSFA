@@ -40,8 +40,12 @@ _DOMAIN_ALIASES.update(
     {
         "sensitive_info_stealing": "sensitive_information_stealing",
         "danger_ops_and_tool_abuse": "dangerous_operations_and_tool_abuse",
+        "dangerous_operations_tool_abuse": "dangerous_operations_and_tool_abuse",
         "hazardous_action": "hazardous_action_generation",
         "sensitive_info_leakage": "sensitive_information_leakage",
+        # The official response Parquet uses *_output names for its Level-1 labels.
+        "hazardous_action_output": "hazardous_action_generation",
+        "sensitive_info_output": "sensitive_information_leakage",
     }
 )
 

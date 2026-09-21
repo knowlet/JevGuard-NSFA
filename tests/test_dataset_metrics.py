@@ -37,6 +37,21 @@ def test_no_risk_has_no_domain() -> None:
     assert canonical_domains("No_Risk") == ()
 
 
+def test_official_response_domain_aliases_are_canonicalized() -> None:
+    assert canonical_domains("hazardous_action_output") == ("hazardous_action_generation",)
+    assert canonical_domains("sensitive_info_output") == ("sensitive_information_leakage",)
+    assert canonical_domains("hazardous_action_output;sensitive_info_output") == (
+        "hazardous_action_generation",
+        "sensitive_information_leakage",
+    )
+
+
+def test_official_singguard_head_domain_alias_is_canonicalized() -> None:
+    assert canonical_domains("Dangerous_Operations_Tool_Abuse") == (
+        "dangerous_operations_and_tool_abuse",
+    )
+
+
 def test_binary_metrics_known_confusion_matrix() -> None:
     metrics = binary_metrics(
         labels=[1, 1, 0, 0],
