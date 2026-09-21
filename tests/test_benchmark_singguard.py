@@ -545,6 +545,17 @@ def test_add_arguments_registers_partial_heads_and_dataset_revision() -> None:
     assert parsed.dataset_revision == "abc123"
 
 
+def test_add_arguments_registers_model_revision() -> None:
+    parser = argparse.ArgumentParser()
+    bench.add_arguments(parser)
+
+    defaults = parser.parse_args([])
+    assert defaults.model_revision is None
+
+    parsed = parser.parse_args(["--model-revision", "abc123"])
+    assert parsed.model_revision == "abc123"
+
+
 # ------------------------------------------------------------------- ISSUE 3 coverage
 
 

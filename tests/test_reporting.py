@@ -167,7 +167,7 @@ def _install_guard_stub(monkeypatch: pytest.MonkeyPatch, errors: list[BaseExcept
             self.policy = policy
             self.client = client
 
-        async def screen(self, text: str, side: Side) -> GuardResult:
+        async def screen(self, text: str, side: Side, *, timeout: float | None = None) -> GuardResult:
             recorder.screen_calls.append(text)
             error = remaining.pop(0) if remaining else None
             if error is not None:
@@ -421,6 +421,26 @@ def test_dataset_loader_forwards_a_revision_only_when_it_is_set(monkeypatch: pyt
 
     assert list(iter_huggingface_rows()) == []
     assert "revision" not in calls[1]  # the hub default must not be spelled as a fake revision
+
+
+def test_benchmark_parquet_uri_carries_the_requested_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    fake_datasets = types.ModuleType("datasets")
+
+    def load_dataset(*args: Any, **kwargs: Any) -> list[Any]:
+        calls.append((args, kwargs))
+        return []
+
+    fake_datasets.load_dataset = load_dataset  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+    list(iter_huggingface_rows(benchmark="query", revision="abc123"))
+    assert calls[0][0] == ("parquet",)
+    assert calls[0][1]["data_files"]["train"] == (
+        "hf://datasets/inclusionAI/NSFA_Benchmarks@abc123/NSFA_Query_Multilingual.parquet"
+    )
+    assert calls[0][1]["split"] == "train"
+    assert "revision" not in calls[0][1]
 
 
 def test_negative_retries_are_rejected() -> None:
@@ -820,9 +840,9 @@ def test_retry_wait_reads_retry_after_headers_and_otherwise_backs_off() -> None:
     assert 6.0 <= benchmark_jev.retry_wait_seconds(6, _server_error(500)) <= 8.0
     assert 6.0 <= benchmark_jev.retry_wait_seconds(30, _server_error(500)) <= 8.0
 
-    # Even a server-requested wait is capped, so one row cannot pin the runner.
+    # A server-requested wait is authoritative; the row budget decides whether it can be used.
     long_wait = TypeSafeRateLimitError(429, {}, httpx2.Headers({"retry-after": "120"}))
-    assert benchmark_jev.retry_wait_seconds(1, long_wait) == benchmark_jev._RETRY_WAIT_CAP_SECONDS
+    assert benchmark_jev.retry_wait_seconds(1, long_wait) == 120.0
 
 
 def test_retryable_classification_matches_the_sdk_default_policy() -> None:

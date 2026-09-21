@@ -19,7 +19,7 @@ singguard = [
   "datasets>=4.0",
   "huggingface-hub>=0.35",
   "numpy>=2.0",
-  "torch>=2.7",
+  "torch>=2.10",
   "transformers>=4.56",
   "vllm>=0.10",
 ]

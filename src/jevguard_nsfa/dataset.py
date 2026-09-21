@@ -142,18 +142,15 @@ def iter_huggingface_rows(
 ) -> Iterable[BenchmarkRow]:
     """Yield the selected benchmark rows in emitted order.
 
-    ``revision`` is forwarded to ``load_dataset`` unchanged, but only when it is set: the
-    default ``None`` means "whatever the hub resolves as latest", and the benchmark runners
-    record that unresolvable case as a JSON ``null`` instead of inventing a revision name.
+    For benchmark-specific Parquet files, ``revision`` is embedded in the ``hf://`` object URI
+    so the remote file itself is pinned. For dataset-builder loading, it is forwarded as the
+    builder revision. The default ``None`` means "whatever the hub resolves as latest", and the
+    benchmark runners record that unpinned case as JSON ``null``.
     """
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - dependency error
         raise RuntimeError("Install the benchmark extra: pip install -e '.[benchmark]'") from exc
-
-    load_kwargs: dict[str, Any] = {"split": split}
-    if revision is not None:
-        load_kwargs["revision"] = revision
 
     forced_side = side
     if benchmark is not None:
@@ -164,9 +161,13 @@ def iter_huggingface_rows(
         if side is not None and side is not benchmark_side:
             raise ValueError(f"Benchmark {benchmark!r} is {benchmark_side.value}-side, not {side.value}-side")
         forced_side = benchmark_side
-        source = f"hf://datasets/{dataset_name}/{filename}"
-        dataset = load_dataset("parquet", data_files={"train": source}, **load_kwargs)
+        revision_suffix = f"@{revision}" if revision is not None else ""
+        source = f"hf://datasets/{dataset_name}{revision_suffix}/{filename}"
+        dataset = load_dataset("parquet", data_files={"train": source}, split=split)
     else:
+        load_kwargs: dict[str, Any] = {"split": split}
+        if revision is not None:
+            load_kwargs["revision"] = revision
         dataset = load_dataset(dataset_name, **load_kwargs)
     if seed is not None:
         dataset = dataset.shuffle(seed=seed)

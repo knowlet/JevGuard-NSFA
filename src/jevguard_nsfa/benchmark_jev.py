@@ -18,7 +18,8 @@ rows while the attempt budget bounds how long one row can hold a slot.
 budget for one row's attempt sequence: a retry is not started when its wait would push the row past
 that budget, so a row cannot outlive the deadline the operator configured. The per-attempt wait is
 ``Retry-After`` when the failure carries it, otherwise exponential backoff from 0.5s with jitter,
-capped at ``_RETRY_WAIT_CAP_SECONDS``.
+capped at the local ``_RETRY_BACKOFF_CAP_SECONDS``. A server-provided ``Retry-After`` value is
+kept as requested; the total row budget decides whether another attempt can begin.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import json
 import math
 import random
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic, perf_counter, time
@@ -56,7 +58,6 @@ _RETRYABLE_HTTP_STATUSES = frozenset({408, 429})
 _RETRY_BACKOFF_INITIAL_SECONDS = 0.5
 _RETRY_BACKOFF_CAP_SECONDS = 8.0
 _RETRY_BACKOFF_JITTER = 0.25
-_RETRY_WAIT_CAP_SECONDS = 30.0
 
 
 def _sha256_lines(lines: Iterable[str]) -> str:
@@ -145,15 +146,15 @@ def _retry_after_seconds(error: BaseException) -> float | None:
 def retry_wait_seconds(attempt: int, error: BaseException) -> float:
     """Delay in seconds before the next attempt, for the 1-based ``attempt`` that just failed.
 
-    ``Retry-After`` wins when the failure exposes one; otherwise the wait is exponential backoff
-    from 0.5s (jittered, capped). Any wait is itself capped, so a hostile server cannot pin the
-    runner on one row.
+    ``Retry-After`` wins when the failure exposes one. Server-requested waits are not shortened;
+    the row budget decides whether another attempt is allowed. Without that header, use local
+    exponential backoff from 0.5s with jitter and a local cap.
     """
     delay = _retry_after_seconds(error)
     if delay is None:
         delay = min(_RETRY_BACKOFF_INITIAL_SECONDS * 2 ** (attempt - 1), _RETRY_BACKOFF_CAP_SECONDS)
         delay *= 1.0 - _RETRY_BACKOFF_JITTER * random.random()
-    return min(delay, _RETRY_WAIT_CAP_SECONDS)
+    return delay
 
 
 async def _sleep(seconds: float) -> None:
@@ -206,12 +207,20 @@ async def _screen_with_attempts(
     while True:
         await limiter.acquire()
         if attempts == 0:
-            # The retry budget covers the attempts and their waits: provider pacing from the
-            # limiter is charged to the run's rpm budget, not to this row's retry budget.
+            # Start the logical-request clock immediately before the first attempt.
             started = now()
         attempts += 1
+        remaining = budget if budget is not None and attempts == 1 else None
+        if budget is not None and attempts > 1:
+            remaining = budget - (now() - started)
+            if remaining <= 0:
+                return None, "retry budget exhausted before attempt", attempts - 1
         try:
-            return await guard.screen(row.text, row.side), None, attempts
+            if remaining is None:
+                result = await guard.screen(row.text, row.side)
+            else:
+                result = await guard.screen(row.text, row.side, timeout=remaining)
+            return replace(result, latency_ms=max(0.0, now() - started) * 1000.0), None, attempts
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             if attempts > retries or not _is_retryable(exc):

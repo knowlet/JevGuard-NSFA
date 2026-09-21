@@ -74,13 +74,13 @@ class JevGuard:
             timeout=timeout,
         )
 
-    def screen(self, text: str, side: Side | str) -> GuardResult:
+    def screen(self, text: str, side: Side | str, *, timeout: float | None = None) -> GuardResult:
         side = Side(side)
         started = perf_counter()
-        response = self.client.system_one(
-            state={"untrusted_text": text},
-            questions=questions_for(side),
-        )
+        request = {"state": {"untrusted_text": text}, "questions": questions_for(side)}
+        if timeout is not None:
+            request["timeout"] = timeout
+        response = self.client.system_one(**request)
         return _result_from_response(
             response=response,
             side=side,
@@ -138,13 +138,13 @@ class AsyncJevGuard:
             timeout=timeout,
         )
 
-    async def screen(self, text: str, side: Side | str) -> GuardResult:
+    async def screen(self, text: str, side: Side | str, *, timeout: float | None = None) -> GuardResult:
         side = Side(side)
         started = perf_counter()
-        response = await self.client.system_one(
-            state={"untrusted_text": text},
-            questions=questions_for(side),
-        )
+        request = {"state": {"untrusted_text": text}, "questions": questions_for(side)}
+        if timeout is not None:
+            request["timeout"] = timeout
+        response = await self.client.system_one(**request)
         return _result_from_response(
             response=response,
             side=side,

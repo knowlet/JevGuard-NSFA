@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -109,6 +110,31 @@ def _head_class(nn: Any) -> type:
     return EmbeddingHead
 
 
+def _snapshot_revision(path: str | Path) -> str | None:
+    name = Path(path).name
+    return name if re.fullmatch(r"[0-9a-f]{40}", name) else None
+
+
+def _resolve_model_snapshot(
+    model: str,
+    revision: str | None,
+    snapshot_download: Any,
+) -> tuple[Path, str | None]:
+    """Resolve one model snapshot shared by heads, tokenizer, and vLLM."""
+    local_model = Path(model)
+    if local_model.exists() or snapshot_download is None:
+        # A caller-supplied local snapshot cannot expose the Hub commit through the
+        # filesystem name. When the operator supplies --model-revision, retain it as
+        # the verified artifact identity recorded in the benchmark report.
+        return local_model, _snapshot_revision(local_model) or revision
+
+    kwargs: dict[str, Any] = {"repo_id": model}
+    if revision is not None:
+        kwargs["revision"] = revision
+    root = Path(snapshot_download(**kwargs))
+    return root, _snapshot_revision(root) or revision
+
+
 def _resolve_heads_dir(model: str, explicit: str | None, snapshot_download: Any) -> Path:
     if explicit:
         path = Path(explicit)
@@ -131,10 +157,27 @@ def _load_heads(model: str, heads_dir: str | None, device: str) -> dict[str, dic
 
     heads: dict[str, dict[str, Any]] = {}
     for path in sorted(resolved.glob("*.pth")):
-        payload = torch.load(path, weights_only=False, map_location=device)
+        try:
+            # These files may come from a remote model repository. Restricted loading
+            # must happen on CPU before validating the checkpoint schema and moving
+            # tensors to the selected device.
+            payload = torch.load(path, weights_only=True, map_location="cpu")
+        except TypeError as exc:
+            raise RuntimeError(
+                "Safe SingGuard checkpoint loading requires torch.load(weights_only=True); "
+                "refusing unrestricted pickle loading"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"Could not safely load SingGuard checkpoint {path}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"SingGuard checkpoint {path} must contain a mapping payload")
         if "head_state_dict" not in payload:
             continue
-        config = dict(payload["head_config"])
+        config_payload = payload.get("head_config")
+        state_dict = payload.get("head_state_dict")
+        if not isinstance(config_payload, Mapping) or not isinstance(state_dict, Mapping):
+            raise ValueError(f"SingGuard checkpoint {path} has an invalid head schema")
+        config = dict(config_payload)
         allowed = {
             "input_size",
             "num_classes",
@@ -146,12 +189,16 @@ def _load_heads(model: str, heads_dir: str | None, device: str) -> dict[str, dic
             "class_weight",
         }
         head = head_type(**{key: value for key, value in config.items() if key in allowed})
-        head.load_state_dict(payload["head_state_dict"])
+        head.load_state_dict(state_dict)
         head.eval().to(dtype=torch.float32, device=device)
+        if "sub_task_name" not in payload or "task" not in payload:
+            raise ValueError(f"SingGuard checkpoint {path} is missing task metadata")
         raw_name = str(payload["sub_task_name"])
         name = canonical_domain(raw_name)
         if name is None:
             raise ValueError(f"Unknown SingGuard NSFA head name: {raw_name!r}")
+        if name in heads:
+            raise ValueError(f"Duplicate SingGuard NSFA head for domain {name!r}")
         heads[name] = {
             "head": head,
             "task": str(payload["task"]).lower(),
@@ -451,6 +498,7 @@ def _infer_batch(
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_side = Side.RESPONSE if args.benchmark == "response" else Side.QUERY
     dataset_revision = getattr(args, "dataset_revision", None)
+    model_revision = getattr(args, "model_revision", None)
     allow_partial_heads = bool(getattr(args, "allow_partial_heads", False))
     languages = set(args.language) if args.language else None
     rows = list(
@@ -469,7 +517,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("No benchmark rows matched the requested filters")
 
-    torch, _, _, AutoTokenizer, _, _, _ = _lazy_runtime()
+    torch, _, snapshot_download, AutoTokenizer, _, _, _ = _lazy_runtime()
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA is required for the default original SingGuard realtime benchmark")
 
@@ -477,7 +525,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     # The head set is validated before the tokenizer/model load and, crucially, before warmup
     # and any measurement: a partial set fails the run instead of silently scoring the missing
     # domains as 0.0 risk probabilities.
-    heads = _load_heads(args.model, args.heads_dir, args.device)
+    model_path, resolved_model_revision = _resolve_model_snapshot(
+        args.model,
+        model_revision,
+        snapshot_download,
+    )
+    model_ref = str(model_path)
+    heads = _load_heads(model_ref, args.heads_dir, args.device)
     head_manifest = _head_manifest(benchmark_side, heads)
     _require_complete_head_set(
         head_manifest,
@@ -492,9 +546,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "Point --heads-dir at the NSFA classification-head directory."
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, truncation_side="left", use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_ref, truncation_side="left", use_fast=True)
     llm = _make_llm(
-        args.model,
+        model_ref,
         args.max_tokens,
         args.gpu_memory_utilization,
         args.tensor_parallel_size,
@@ -593,6 +647,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "engine": "singguard-nsfa",
         "mode": "local-realtime-classification",
         "model": args.model,
+        "model_revision": {
+            "requested": model_revision,
+            "resolved": resolved_model_revision,
+        },
         "hardware": {
             "device": args.device,
             "gpu_name": gpu_name,
@@ -698,6 +756,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", default="inclusionAI/SingGuard-NSFA-0.8B")
+    parser.add_argument(
+        "--model-revision",
+        default=None,
+        help="Hugging Face model revision (commit/tag) used for heads, tokenizer, and vLLM",
+    )
     parser.add_argument("--heads-dir", default=None)
     parser.add_argument(
         "--allow-partial-heads",
