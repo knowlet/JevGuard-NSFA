@@ -74,6 +74,20 @@ def validate_report(path: Path) -> dict[str, Any]:
                 if not _close(actual, binary.get(name)):
                     errors.append(f"quality.binary.{name} does not match TP/FP/TN/FN")
 
+            for name in ("brier", "log_loss"):
+                value = binary.get(name)
+                if value is not None and (
+                    not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0
+                ):
+                    errors.append(f"quality.binary.{name} must be a finite non-negative number")
+            ece = binary.get("expected_calibration_error")
+            if ece is not None and (
+                not isinstance(ece, (int, float))
+                or not math.isfinite(float(ece))
+                or not 0.0 <= float(ece) <= 1.0
+            ):
+                errors.append("quality.binary.expected_calibration_error must be in [0, 1]")
+
     if data.get("engine") == "singguard-nsfa":
         manifest = data.get("head_manifest")
         if not isinstance(manifest, dict) or manifest.get("complete") is not True:

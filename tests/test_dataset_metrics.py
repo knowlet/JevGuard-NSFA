@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from jevguard_nsfa.dataset import BenchmarkRow, canonical_domains, row_from_mapping
@@ -143,6 +145,8 @@ def test_complete_score_set_evaluates_exactly_as_before() -> None:
         "false_positive_rate": 1.0,
         "false_negative_rate": 0.0,
         "brier": ((0.9 - 1) ** 2 + (0.6 - 0) ** 2) / 2,
+        "log_loss": (-math.log(0.9) - math.log(0.4)) / 2,
+        "expected_calibration_error": pytest.approx(0.35),
         "tp": 1,
         "fp": 1,
         "tn": 0,
@@ -159,6 +163,8 @@ def test_complete_score_set_evaluates_exactly_as_before() -> None:
         "false_positive_rate": 0.0,
         "false_negative_rate": 0.0,
         "brier": ((0.9 - 1) ** 2 + (0.4 - 0) ** 2) / 2,
+        "log_loss": (-math.log(0.9) - math.log(0.6)) / 2,
+        "expected_calibration_error": pytest.approx(0.25),
         "tp": 1,
         "fp": 0,
         "tn": 1,

@@ -23,6 +23,11 @@ singguard = [
   "transformers>=4.56",
   "vllm>=0.10",
 ]
+open = [
+  "datasets>=4.0",
+  "numpy>=2.0",
+  "laya>=0.3.4",
+]
 dev = [
   "pytest>=8.4",
   "pytest-asyncio>=1.1",

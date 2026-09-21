@@ -13,9 +13,18 @@ on:
           - response
           - cross-source-query
       limit:
-        description: Number of samples
+        description: Number of samples when full=false
         required: true
         default: "1000"
+      full:
+        description: Score the entire selected benchmark subset
+        required: true
+        default: false
+        type: boolean
+      dataset_revision:
+        description: Pinned NSFA dataset revision
+        required: true
+        default: 54b390c5b9c26ec40ce7f660e278d909f4dad8dc
       concurrency:
         description: Concurrent Jev requests
         required: true
@@ -51,9 +60,14 @@ jobs:
         run: test -n "$TYPESAFE_API_KEY"
       - name: Run benchmark
         run: |
+          limit_args=(--limit "${{ inputs.limit }}")
+          if [ "${{ inputs.full }}" = "true" ]; then
+            limit_args=(--full)
+          fi
           jevguard-nsfa bench-jev \
             --benchmark "${{ inputs.benchmark }}" \
-            --limit "${{ inputs.limit }}" \
+            --dataset-revision "${{ inputs.dataset_revision }}" \
+            "${limit_args[@]}" \
             --concurrency "${{ inputs.concurrency }}" \
             --rpm "${{ inputs.rpm }}" \
             --model "${{ inputs.model }}" \
