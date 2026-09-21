@@ -83,6 +83,8 @@ def alignment(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
     fingerprint_values = [_raw(report, "dataset.fingerprint") for report in values]
     revision_values = [_raw(report, "dataset.revision") for report in values]
     threshold_values = [_raw(report, "parameters.threshold") for report in values]
+    successful_values = [_raw(report, "samples.successful") for report in values]
+    successful_digest_values = [_raw(report, "samples.successful_sha256") for report in values]
     latency_scope_values = [_raw(report, "latency_scope") for report in values]
     batch_sizes = [_raw(report, "parameters.batch_size") for report in values]
 
@@ -90,7 +92,16 @@ def alignment(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
     fingerprint_ok = _same_present(fingerprint_values)
     threshold_ok = _same_present(threshold_values)
     revision_ok = _revisions_compatible(revision_values)
-    quality_ok = benchmark_ok and fingerprint_ok and threshold_ok and revision_ok
+    successful_ok = _same_present(successful_values)
+    successful_digest_ok = _same_present(successful_digest_values)
+    quality_ok = (
+        benchmark_ok
+        and fingerprint_ok
+        and threshold_ok
+        and revision_ok
+        and successful_ok
+        and successful_digest_ok
+    )
 
     latency_scope_ok = all(value == "request" for value in latency_scope_values)
     batch_ok = all(value in (_MISSING, 1) for value in batch_sizes)
@@ -104,6 +115,8 @@ def alignment(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "dataset.fingerprint": fingerprint_ok,
             "dataset.revision": revision_ok,
             "parameters.threshold": threshold_ok,
+            "samples.successful": successful_ok,
+            "samples.successful_sha256": successful_digest_ok,
             "latency_scope=request": latency_scope_ok,
             "batch_size<=1": batch_ok,
         },
