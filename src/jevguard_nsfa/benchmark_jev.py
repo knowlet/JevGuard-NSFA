@@ -259,6 +259,8 @@ async def _run_one(
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     languages = set(args.language) if args.language else None
     dataset_revision = getattr(args, "dataset_revision", None)
+    full_dataset = bool(getattr(args, "full", False))
+    selected_limit = None if full_dataset else args.limit
     rows = list(
         iter_huggingface_rows(
             dataset_name=args.dataset,
@@ -266,7 +268,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             benchmark=args.benchmark,
             languages=languages,
             id_contains=args.id_contains,
-            limit=args.limit,
+            limit=selected_limit,
             seed=args.seed,
             revision=dataset_revision,
         )
@@ -365,6 +367,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "retries": args.retries,
             "warmup_requests": args.warmup,
             "input_price_usd_per_million": args.input_price_per_million,
+            "requested_limit": None if full_dataset else args.limit,
+            "full_dataset": full_dataset,
         },
         "samples": {
             "attempted": len(rows),
@@ -417,6 +421,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--language", action="append", help="Language code; repeat to include multiple languages")
     parser.add_argument("--id-contains", default=None, help="Optional substring filter for dataset row ids")
     parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--full", action="store_true", help="Ignore --limit and score the full selected benchmark subset")
     parser.add_argument("--seed", type=int, default=42)
     # Left unset so the SDK resolves the model as explicit value -> TYPESAFE_DEFAULT_MODEL -> SDK
     # default; a hardcoded default here would make the environment variable unreachable.
@@ -448,8 +453,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def main_from_args(args: argparse.Namespace) -> int:
-    if args.limit is not None and args.limit <= 0:
-        raise ValueError("--limit must be positive")
+    if not getattr(args, "full", False) and (args.limit is None or args.limit <= 0):
+        raise ValueError("--limit must be positive unless --full is set")
     if args.concurrency <= 0:
         raise ValueError("--concurrency must be positive")
     if args.retries < 0:
