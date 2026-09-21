@@ -61,13 +61,16 @@ def _fmt(value: Any, digits: int) -> str:
 
 
 def _same_present(values: list[Any]) -> bool:
-    known = [value for value in values if value is not _MISSING]
-    return bool(known) and all(value == known[0] for value in known[1:])
+    if not values or any(value is _MISSING for value in values):
+        return False
+    return all(value == values[0] for value in values[1:])
 
 
 def _revisions_compatible(revisions: list[Any]) -> bool:
-    """Null means unpinned/unknown; conflicting non-null revisions are incompatible."""
-    known = {value for value in revisions if value not in (_MISSING, None)}
+    """Null means unpinned; a missing key is unknown and cannot prove alignment."""
+    if not revisions or any(value is _MISSING for value in revisions):
+        return False
+    known = {value for value in revisions if value is not None}
     return len(known) <= 1
 
 
