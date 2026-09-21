@@ -220,8 +220,8 @@ Use:
 This PR adds the reusable benchmark adapters, larger/full-dataset selection, N-way matrix comparator, calibration metrics, and unit tests. The first full-set round has now executed on this machine:
 
 - cross-source-query, full 3,435 rows: JevGuard, SingGuard and Decider-2b all zero-failure with matching fingerprints and successful-sample digests, so quality and latency deltas are both comparable;
-- query, full 63,431 rows: SingGuard zero-failure, JevGuard 63,429/63,431 (two TypeSafe timeouts), so that pair reports per-engine values and the comparator withholds the delta;
-- response, full 29,972 rows: SingGuard only; the JevGuard run is blocked by TypeSafe API credit exhaustion (HTTP 402);
+- query, full 63,431 rows, and response, full 29,972 rows: both engines zero-failure and fully paired, so the comparator reports deltas for both;
+- the JevGuard runs needed a runner fix first: `--timeout` was both the per-attempt timeout and the whole row budget, so a single timeout consumed the retry budget. `--row-budget` now separates them (defaulting to `--timeout`); the reruns finished 63,431/63,431 and 29,972/29,972 with 2 and 5 retried rows;
 - Decider-2b: served locally from the pinned `Mapika/decider-2b` snapshot through `POST /v1/systemone`, so the `systemone-http` adapter now has real-runtime evidence instead of only fake-runtime tests.
 
 Concrete numbers, alignment output and the remaining gaps are in [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md). Kev, Laya and Qwen-2.5-1B-RLCD still have no pinned runtime on this machine, so no accuracy numbers are claimed for them. The 100-row JevGuard/SingGuard measurements remain historical validation evidence.
