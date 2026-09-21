@@ -123,3 +123,10 @@ PYTHONPATH=src .venv/bin/python scripts/validate_benchmark_results.py \
 - 0.8B、單張 NVIDIA GB10；尚未測試其他 SingGuard model sizes、GPU、量化或多實例部署。
 - JevGuard 是 managed API，SingGuard 是 local GPU；latency、cost 與 throughput 不是相同部署邊界的純模型比較。
 - SingGuard 成本使用 $1.50/GPU-hour 情境假設；JevGuard cost 使用報告中的 API input price，不包含所有可能的服務費用。
+
+
+## Expanded benchmark follow-up
+
+The 100-row measurements above predate the expanded benchmark schema, so they do not contain the newly added log-loss or expected-calibration-error fields. Do not backfill those values from aggregate confusion matrices.
+
+The next validation round is specified in [BENCHMARK_MATRIX.md](BENCHMARK_MATRIX.md): 500/1,000-row paired runs, a mandatory full 3,435-row cross-source-query run, language slices, and Kev/Laya/Decider/RLCD comparison adapters. New model results should only be added here after their pinned runtimes actually execute and their report fingerprints pass independent validation.
