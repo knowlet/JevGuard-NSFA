@@ -887,6 +887,84 @@ def test_a_retry_is_not_started_when_its_wait_would_exceed_the_timeout_budget(
     assert report["samples"]["successful"] == 0
 
 
+def test_row_budget_above_the_request_timeout_lets_a_timed_out_attempt_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rare hang must not end the row when the operator widened the row budget."""
+    ticks = iter([0.0, 10.0, 10.0, 11.0])
+    monkeypatch.setattr(benchmark_jev, "monotonic", lambda: next(ticks))
+
+    report, recorder, acquires, waits = _run_jev_with_guard_stub(
+        monkeypatch,
+        errors=[TypeSafeAPITimeoutError(5.0), None],
+        rows=_stub_rows()[:1],
+        retries=2,
+        timeout=5.0,
+        row_budget=60.0,
+    )
+
+    assert recorder.screen_calls == ["row-1", "row-1"]  # the timed-out attempt was retried
+    assert acquires[0] == 2  # the limiter saw both real attempts
+    assert len(waits) == 1
+    assert report["parameters"]["timeout_seconds"] == 5.0
+    assert report["parameters"]["row_budget_seconds"] == 60.0
+    assert report["samples"]["successful"] == 1
+    assert report["samples"]["failed"] == 0
+    assert report["samples"]["request_attempts"] == 2
+    assert report["samples"]["retried_requests"] == 1
+
+
+def test_row_budget_exhaustion_is_reported_and_the_row_is_never_scored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that runs out of budget between attempts fails; it is not scored and not retried."""
+    ticks = iter([0.0, 1.0, 40.0])
+    monkeypatch.setattr(benchmark_jev, "monotonic", lambda: next(ticks))
+
+    report, recorder, acquires, waits = _run_jev_with_guard_stub(
+        monkeypatch,
+        errors=[_server_error(500), None],
+        rows=_stub_rows()[:1],
+        retries=5,
+        timeout=5.0,
+        row_budget=30.0,
+    )
+
+    assert recorder.screen_calls == ["row-1"]  # no budget was left to start a second attempt
+    assert acquires[0] == 1
+    assert len(waits) == 1
+    assert report["samples"]["failed"] == 1
+    assert report["samples"]["successful"] == 0
+    assert report["quality"] is None
+    assert report["failures"][0]["error"] == "retry budget exhausted before attempt"
+    assert report["failures"][0]["attempts"] == 1
+    assert recorder.fallback_calls == []
+
+
+def test_row_budget_defaults_to_the_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without an explicit row budget the historical single-deadline behaviour is kept."""
+    report, _, _, _ = _run_jev_with_guard_stub(
+        monkeypatch,
+        errors=[_server_error(500), None],
+        rows=_stub_rows()[:1],
+        retries=1,
+        timeout=60.0,
+    )
+
+    assert report["parameters"]["row_budget_seconds"] == 60.0
+    assert report["samples"]["successful"] == 1
+
+
+def test_row_budget_argument_is_optional_and_must_be_positive() -> None:
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["bench-jev"]).row_budget is None
+    assert parser.parse_args(["bench-jev", "--row-budget", "120"]).row_budget == 120.0
+
+    with pytest.raises(ValueError, match="--row-budget must be positive"):
+        benchmark_jev.main_from_args(parser.parse_args(["bench-jev", "--row-budget", "-1"]))
+
+
 # --------------------------------------------------------------------------- #
 # ISSUE 4: --model must stay unset so TYPESAFE_DEFAULT_MODEL can resolve.
 # --------------------------------------------------------------------------- #

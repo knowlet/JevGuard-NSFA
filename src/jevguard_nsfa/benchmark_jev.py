@@ -14,12 +14,15 @@ never reinterpreted as a safe verdict and never turned into a System-Two fallbac
 row holds its ``--concurrency`` slot across its attempts, so concurrency keeps bounding in-flight
 rows while the attempt budget bounds how long one row can hold a slot.
 
-``--timeout`` is the per-request HTTP timeout handed to the SDK and is also used as the total
-budget for one row's attempt sequence: a retry is not started when its wait would push the row past
-that budget, so a row cannot outlive the deadline the operator configured. The per-attempt wait is
-``Retry-After`` when the failure carries it, otherwise exponential backoff from 0.5s with jitter,
-capped at the local ``_RETRY_BACKOFF_CAP_SECONDS``. A server-provided ``Retry-After`` value is
-kept as requested; the total row budget decides whether another attempt can begin.
+``--timeout`` is the per-request HTTP timeout handed to the SDK. ``--row-budget`` is the total
+budget for one row's attempt sequence and defaults to ``--timeout``: with that default one
+timed-out attempt spends the whole budget and the row fails without a retry, so a full-corpus run
+that has to survive a rare transport hang sets ``--row-budget`` above ``--timeout``. A retry is not
+started when its wait would push the row past that budget, so a row cannot outlive the deadline the
+operator configured. The per-attempt wait is ``Retry-After`` when the failure carries it, otherwise
+exponential backoff from 0.5s with jitter, capped at the local ``_RETRY_BACKOFF_CAP_SECONDS``.
+A server-provided ``Retry-After`` value is kept as requested; the total row budget decides whether
+another attempt can begin.
 """
 
 from __future__ import annotations
@@ -190,6 +193,7 @@ async def _screen_with_attempts(
     limiter: RequestStartLimiter,
     *,
     retries: int,
+    timeout: float | None,
     budget: float | None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     clock: Callable[[], float] | None = None,
@@ -199,27 +203,34 @@ async def _screen_with_attempts(
     With ``RetryPolicy(max_retries=0)`` each ``guard.screen`` call is exactly one real HTTP
     attempt, so the limiter is acquired immediately before every attempt and the provider sees the
     true request rate. A failure is reported as a failure; it is never converted into a verdict.
+
+    ``timeout`` bounds a single HTTP attempt while ``budget`` bounds the whole row, so a row that
+    hits a rare transport hang can still use its retries. When the two are equal, a timed-out
+    attempt spends the entire budget and the row fails without a second attempt.
     """
     sleeper = sleep or _sleep
     now = clock or monotonic
     started = 0.0
     attempts = 0
     while True:
+        attempt_timeout = timeout
+        if budget is not None and attempts > 0:
+            # The budget gate runs before the limiter so a row that cannot start another
+            # attempt never reserves a request slot it will not use.
+            remaining = budget - (now() - started)
+            if remaining <= 0:
+                return None, "retry budget exhausted before attempt", attempts
+            attempt_timeout = remaining if timeout is None else min(timeout, remaining)
         await limiter.acquire()
         if attempts == 0:
             # Start the logical-request clock immediately before the first attempt.
             started = now()
         attempts += 1
-        remaining = budget if budget is not None and attempts == 1 else None
-        if budget is not None and attempts > 1:
-            remaining = budget - (now() - started)
-            if remaining <= 0:
-                return None, "retry budget exhausted before attempt", attempts - 1
         try:
-            if remaining is None:
+            if attempt_timeout is None:
                 result = await guard.screen(row.text, row.side)
             else:
-                result = await guard.screen(row.text, row.side, timeout=remaining)
+                result = await guard.screen(row.text, row.side, timeout=attempt_timeout)
             return replace(result, latency_ms=max(0.0, now() - started) * 1000.0), None, attempts
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -238,6 +249,7 @@ async def _run_one(
     limiter: RequestStartLimiter,
     *,
     retries: int = 0,
+    timeout: float | None = None,
     budget: float | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     clock: Callable[[], float] | None = None,
@@ -249,6 +261,7 @@ async def _run_one(
             guard,
             limiter,
             retries=retries,
+            timeout=timeout,
             budget=budget,
             sleep=sleep,
             clock=clock,
@@ -282,7 +295,15 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     # SDK retries are disabled on purpose: this runner retries so that every real HTTP attempt is
     # acquired from the limiter and counted in samples.request_attempts.
     retry = RetryPolicy(max_retries=0)
-    retry_budget = float(args.timeout) if args.timeout and args.timeout > 0 else None
+    request_timeout = float(args.timeout) if args.timeout and args.timeout > 0 else None
+    row_budget = getattr(args, "row_budget", None)
+    # Default to the historical single-value deadline: one row may not outlive ``--timeout``
+    # unless the operator widens the retry window with ``--row-budget``.
+    retry_budget = (
+        request_timeout
+        if row_budget is None
+        else (float(row_budget) if row_budget and row_budget > 0 else None)
+    )
 
     warmup_tokens = 0
     async with AsyncTypeSafeClient(
@@ -301,7 +322,15 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         started = perf_counter()
         outcomes = await asyncio.gather(
             *(
-                _run_one(row, guard, semaphore, limiter, retries=args.retries, budget=retry_budget)
+                _run_one(
+                    row,
+                    guard,
+                    semaphore,
+                    limiter,
+                    retries=args.retries,
+                    timeout=request_timeout,
+                    budget=retry_budget,
+                )
                 for row in rows
             )
         )
@@ -364,6 +393,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "concurrency": args.concurrency,
             "rpm": args.rpm,
             "timeout_seconds": args.timeout,
+            "row_budget_seconds": retry_budget,
             "retries": args.retries,
             "warmup_requests": args.warmup,
             "input_price_usd_per_million": args.input_price_per_million,
@@ -439,7 +469,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--timeout",
         type=float,
         default=15.0,
-        help="Per-request HTTP timeout in seconds; also the total attempt budget for one row",
+        help="Per-request HTTP timeout in seconds; the default total attempt budget for one row",
+    )
+    parser.add_argument(
+        "--row-budget",
+        type=float,
+        default=None,
+        help=(
+            "Total seconds one row may spend across all of its attempts, including retries; "
+            "defaults to --timeout, which means one timed-out attempt exhausts the budget"
+        ),
     )
     parser.add_argument(
         "--retries",
@@ -459,6 +498,8 @@ def main_from_args(args: argparse.Namespace) -> int:
         raise ValueError("--concurrency must be positive")
     if args.retries < 0:
         raise ValueError("--retries must be non-negative")
+    if getattr(args, "row_budget", None) is not None and args.row_budget <= 0:
+        raise ValueError("--row-budget must be positive when set")
     report = asyncio.run(run_benchmark(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Undefined metrics are None, never NaN, so the artifact must stay strict JSON.
