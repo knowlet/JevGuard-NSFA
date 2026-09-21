@@ -225,18 +225,22 @@ class LayaBackend:
         self.engine = "laya"
         self.model = model
         self.device = device
+        self.version = str(getattr(laya, "__version__", "unknown"))
         self._routed = model == "routed"
         if self._routed:
+            # Preload English + multilingual so alternating NSFA languages do not pay
+            # seconds of checkpoint reload time inside the measured request latency.
             self.runtime = laya.Router(device=device, max_loaded=2)
+            self.runtime.preload(["english", "multilingual"])
         else:
-            aliases = {
-                "english": "convaiinnovations/laya",
-                "multilingual": "convaiinnovations/laya-multilingual",
-                "typed-decisions": "convaiinnovations/laya-typed-decisions",
+            aliases: dict[str, tuple[str, str | None]] = {
+                "english": ("convaiinnovations/laya", None),
+                "multilingual": ("convaiinnovations/laya", "multilingual"),
+                "typed-decisions": ("convaiinnovations/laya", "typed-decisions"),
             }
-            repo = aliases.get(model, model)
-            self.runtime = laya.load(repo, device=device)
-            self.model = repo
+            repo, subfolder = aliases.get(model, (model, None))
+            self.runtime = laya.load(repo, device=device, subfolder=subfolder)
+            self.model = repo if subfolder is None else f"{repo}/{subfolder}"
 
     def screen(self, row: BenchmarkRow, policy: ThresholdPolicy) -> GuardResult:
         questions = plain_questions_for(row.side)
@@ -265,7 +269,7 @@ class LayaBackend:
         return None
 
     def metadata(self) -> dict[str, Any]:
-        return {"device": self.device, "routing": self._routed}
+        return {"device": self.device, "routing": self._routed, "laya_version": self.version}
 
 
 class RLCDHTTPBackend:
@@ -409,7 +413,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "model": resolved_models[0] if len(resolved_models) == 1 else (args.model or args.engine),
         "model_revision": {
             "requested": args.model_revision,
-            "resolved": args.model_revision,
+            # Generic HTTP adapters cannot prove the remote server's artifact commit.
+            # Pin the server itself and record that ref as requested provenance instead
+            # of pretending the wire protocol verified it.
+            "resolved": None,
         },
         "backend": backend.metadata(),
         "hardware": {
