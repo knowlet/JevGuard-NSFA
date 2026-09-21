@@ -28,7 +28,7 @@ from .benchmark_jev import _rows_fingerprint, _rows_id_digest
 from .dataset import BenchmarkRow, iter_huggingface_rows
 from .guard import JevGuard
 from .metrics import evaluate_guard_results, latency_summary
-from .models import Decision, GuardResult, Side, ThresholdPolicy
+from .models import GuardResult, Side, ThresholdPolicy
 from .taxonomy import RiskDomain, domains_for
 
 DEFAULT_DATASET = "inclusionAI/NSFA_Benchmarks"
