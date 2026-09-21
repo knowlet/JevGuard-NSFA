@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from jevguard_nsfa.dataset import BenchmarkRow, canonical_domains, row_from_mapping
