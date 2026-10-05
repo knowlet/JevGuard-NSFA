@@ -29,6 +29,7 @@ open = [
   "laya>=0.3.4",
 ]
 dev = [
+  "PyYAML>=6.0",
   "pytest>=8.4",
   "pytest-asyncio>=1.1",
   "ruff>=0.12",

@@ -891,7 +891,7 @@ def test_row_budget_above_the_request_timeout_lets_a_timed_out_attempt_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A rare hang must not end the row when the operator widened the row budget."""
-    ticks = iter([0.0, 10.0, 10.0, 11.0])
+    ticks = iter([0.0, 10.0, 10.0, 11.0, 11.0])
     monkeypatch.setattr(benchmark_jev, "monotonic", lambda: next(ticks))
 
     report, recorder, acquires, waits = _run_jev_with_guard_stub(

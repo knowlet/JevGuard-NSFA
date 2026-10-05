@@ -243,7 +243,7 @@ stdout.
 
 本機 NVIDIA GB10 的既有實測、資料品質掃描與 JevGuard 對 SingGuard 比較，請參考 [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md)。
 
-下一輪擴大樣本與多模型比較（Kev、Laya、Decider-2B、Qwen RLCD）的固定測試矩陣、runtime adapter 與重現命令，請參考 [BENCHMARK_MATRIX.md](BENCHMARK_MATRIX.md)。
+作者回報已完成 JevGuard／SingGuard 的 query、response、cross-source-query 全量測試，以及 Decider-2b 的 cross-source-query 全量測試；原始七份 JSON 未隨 PR 附上，仍待獨立 artifact／fingerprint 複核，詳見 [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md)。Kev、Laya、Qwen RLCD 仍待實測；固定測試矩陣與重現命令見 [BENCHMARK_MATRIX.md](BENCHMARK_MATRIX.md)。
 
 ### Expanded benchmark engines
 
@@ -274,7 +274,7 @@ The generic runner normalizes open decision engines to the same NSFA Level-1 pro
       --benchmark query \
       --limit 1000
 
-Use `--full` on `bench-jev`, `bench-singguard`, or `bench-open` to score the entire selected subset. New reports include Brier score, log loss, and 10-bin expected calibration error in addition to the existing classification metrics. The first full-set round (query 63,431, response 29,972, cross-source-query 3,435) is recorded in [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md): all three subsets are zero-failure pairs, and it includes a real Decider-2b cross-source run.
+Use `--full` on `bench-jev`, `bench-singguard`, or `bench-open` to score the entire selected subset. New reports include Brier score, log loss, and 10-bin expected calibration error in addition to the existing classification metrics. Author-reported full-set measurements are recorded in [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md): JevGuard and SingGuard on query 63,431, response 29,972 and cross-source-query 3,435, plus Decider-2b on cross-source-query only. The seven raw JSON reports are not included in this PR, so zero-failure/alignment claims remain pending independent artifact and fingerprint verification. Kev, Laya and Qwen RLCD remain unmeasured.
 
 Render an aligned N-way matrix with:
 
