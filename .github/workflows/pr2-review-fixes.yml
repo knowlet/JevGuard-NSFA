@@ -1,0 +1,81 @@
+name: Validate PR2 review fixes
+on:
+  push:
+    branches: [codex/pr2-review-fixes-7e84106]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Apply fixes to exact original head
+        run: |
+          cp -R _pr2_fix "$RUNNER_TEMP/pr2-fix"
+          git checkout --detach 7e8410611323469b81ad941b3ab4d1f2b69c5189
+          python "$RUNNER_TEMP/pr2-fix/apply.py"
+          mkdir -p "$RUNNER_TEMP/pr2-evidence"
+          git diff --check
+          git diff > "$RUNNER_TEMP/pr2-evidence/fixes.patch"
+      - name: Install real project dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Lint complete project
+        run: ruff check .
+      - name: Test complete project
+        run: pytest --junitxml="$RUNNER_TEMP/pr2-evidence/pytest.xml"
+      - name: Validate actual workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/benchmark-jev.yml .github/workflows/ci.yml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr2-validation-python-${{ matrix.python }}
+          path: ${{ runner.temp }}/pr2-evidence/
+          retention-days: 14
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare clean validated source commit
+        run: |
+          cp -R _pr2_fix "$RUNNER_TEMP/pr2-fix"
+          git checkout --detach 7e8410611323469b81ad941b3ab4d1f2b69c5189
+          python "$RUNNER_TEMP/pr2-fix/apply.py"
+          python -m pip install -e '.[dev]'
+          ruff check .
+          pytest
+          git diff --check
+          git config user.name Codex
+          git config user.email codex@localhost
+          git add .github/workflows/benchmark-jev.yml src/jevguard_nsfa/benchmark_jev.py src/jevguard_nsfa/benchmark_open.py src/jevguard_nsfa/compare.py scripts/validate_benchmark_results.py tests/test_reporting.py tests/test_pr2_regressions.py pyproject.toml README.md BENCHMARK_MATRIX.md BENCHMARK_VALIDATION.md
+          git commit -m 'fix: address PR2 benchmark deadlines, workflow, validation and evidence findings'
+          git push origin HEAD:refs/heads/codex/pr2-validated-7e84106
+          mkdir -p "$RUNNER_TEMP/pr2-source"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/pr2-source/commit.txt"
+          git show --stat --oneline HEAD
+          git archive --format=zip HEAD -o "$RUNNER_TEMP/pr2-source/source.zip"
+          git diff HEAD^ HEAD > "$RUNNER_TEMP/pr2-source/fixes.patch"
+          echo "Validated clean commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr2-validated-source
+          path: ${{ runner.temp }}/pr2-source/
+          retention-days: 14

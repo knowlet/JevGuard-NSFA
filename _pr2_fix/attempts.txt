@@ -1,0 +1,66 @@
+async def _screen_with_attempts(
+    row: BenchmarkRow,
+    guard: AsyncJevGuard,
+    limiter: RequestStartLimiter,
+    *,
+    retries: int,
+    timeout: float | None,
+    budget: float | None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> tuple[GuardResult | None, str | None, int]:
+    """Screen a row under one deadline, including retry backoff and RPM waits.
+
+    Initial admission (including the caller's semaphore wait) is deliberately outside
+    the logical-request latency/budget, as before. Every actual HTTP attempt still
+    requires a limiter slot. The SDK owns no retries. Cancellation is cooperative;
+    external cancellation propagates instead of becoming a scored or failed row.
+    """
+    sleeper = sleep or _sleep
+    now = clock or monotonic
+    await limiter.acquire()
+    started = now()
+    deadline = None if budget is None else started + budget
+    attempts = 0
+    row_timeout = asyncio.timeout(budget)
+    try:
+        async with row_timeout:
+            while True:
+                if attempts:
+                    # Do not reserve another slot if backoff already spent the budget.
+                    if deadline is not None and now() >= deadline:
+                        return None, "retry budget exhausted before attempt", attempts
+                    await limiter.acquire()
+                # Recompute AFTER admission: a retry may have waited behind other rows.
+                remaining = budget if attempts == 0 else (
+                    None if deadline is None else deadline - now()
+                )
+                if remaining is not None and remaining <= 0:
+                    return None, "retry budget exhausted before attempt", attempts
+                attempt_timeout = timeout
+                if remaining is not None:
+                    attempt_timeout = remaining if timeout is None else min(timeout, remaining)
+                attempts += 1
+                try:
+                    if attempt_timeout is None:
+                        result = await guard.screen(row.text, row.side)
+                    else:
+                        result = await guard.screen(row.text, row.side, timeout=attempt_timeout)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    if attempts > retries or not _is_retryable(exc):
+                        return None, error, attempts
+                    delay = retry_wait_seconds(attempts, exc)
+                    if deadline is not None and now() + delay >= deadline:
+                        return None, error, attempts
+                    await sleeper(delay)
+                else:
+                    elapsed = max(0.0, now() - started)
+                    # Also reject a late result from a backend that did not yield.
+                    if budget is not None and elapsed >= budget:
+                        return None, "row budget exhausted", attempts
+                    return replace(result, latency_ms=elapsed * 1000.0), None, attempts
+    except TimeoutError:
+        if not row_timeout.expired():
+            raise
+        return None, "row budget exhausted", attempts

@@ -1,0 +1,25 @@
+def check_pacing_budget(
+    rows: int, warmup: int, rpm: float, budget_seconds: float | None,
+) -> float:
+    """Reject an impossible request-start schedule before any paid API request.
+
+    This is only the no-retry pacing lower bound, NOT a completion-time estimate.
+    The workflow reserves separate time for setup, long tails, validation and upload.
+    """
+    if not math.isfinite(rpm) or rpm <= 0:
+        raise ValueError("--rpm must be finite and positive")
+    if rows < 0 or warmup < 0:
+        raise ValueError("row and warmup counts must be non-negative")
+    minimum_seconds = max(0, rows + warmup - 1) * (60.0 / rpm)
+    if budget_seconds is not None:
+        if not math.isfinite(budget_seconds) or budget_seconds <= 0:
+            raise ValueError("--pacing-budget-seconds must be finite and positive")
+        if minimum_seconds >= budget_seconds:
+            raise ValueError(
+                f"request-start pacing alone needs at least {minimum_seconds:.2f}s "
+                f"for {rows} rows and {warmup} warmups at {rpm:g} RPM; "
+                f"available pacing budget is {budget_seconds:g}s"
+            )
+    return minimum_seconds
+
+
