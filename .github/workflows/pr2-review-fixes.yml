@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -50,11 +50,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Prepare clean validated source commit
+      - name: Export clean validated tree and transfer source blobs
         run: |
           cp -R _pr2_fix "$RUNNER_TEMP/pr2-fix"
           git checkout --detach 7e8410611323469b81ad941b3ab4d1f2b69c5189
@@ -67,15 +67,25 @@ jobs:
           git config user.email codex@localhost
           git add .github/workflows/benchmark-jev.yml src/jevguard_nsfa/benchmark_jev.py src/jevguard_nsfa/benchmark_open.py src/jevguard_nsfa/compare.py scripts/validate_benchmark_results.py tests/test_reporting.py tests/test_pr2_regressions.py pyproject.toml README.md BENCHMARK_MATRIX.md BENCHMARK_VALIDATION.md
           git commit -m 'fix: address PR2 benchmark deadlines, workflow, validation and evidence findings'
-          git push origin HEAD:refs/heads/codex/pr2-validated-7e84106
           mkdir -p "$RUNNER_TEMP/pr2-source"
           git rev-parse HEAD | tee "$RUNNER_TEMP/pr2-source/commit.txt"
+          git rev-parse 'HEAD^{tree}' | tee "$RUNNER_TEMP/pr2-source/validated-tree.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/pr2-source/tree-manifest.txt"
           git show --stat --oneline HEAD
           git archive --format=zip HEAD -o "$RUNNER_TEMP/pr2-source/source.zip"
           git diff HEAD^ HEAD > "$RUNNER_TEMP/pr2-source/fixes.patch"
-          echo "Validated clean commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          # The Actions token cannot edit workflow files. Transfer code blobs only;
+          # the connected GitHub writer will assemble and verify the tested tree.
+          git checkout 7e8410611323469b81ad941b3ab4d1f2b69c5189 -- .github/workflows/benchmark-jev.yml
+          transport_tree=$(git write-tree)
+          transport_commit=$(git commit-tree "$transport_tree" -p 7e8410611323469b81ad941b3ab4d1f2b69c5189 -m 'chore: transfer tested PR2 source blobs without workflow changes')
+          echo "$transport_commit" | tee "$RUNNER_TEMP/pr2-source/transport-commit.txt"
+          echo "$transport_tree" | tee "$RUNNER_TEMP/pr2-source/transport-tree.txt"
+          git push origin "$transport_commit":refs/heads/codex/pr2-validated-7e84106
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: pr2-validated-source
           path: ${{ runner.temp }}/pr2-source/
           retention-days: 14
+          if-no-files-found: error
