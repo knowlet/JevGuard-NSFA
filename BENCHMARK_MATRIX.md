@@ -1,6 +1,6 @@
 # Expanded NSFA benchmark matrix
 
-This document defines the next comparison round for JevGuard-NSFA. It expands the original JevGuard vs SingGuard validation to larger sample sizes and additional typed-decision engines without treating unlike runtime boundaries as interchangeable.
+This document defines the expanded comparison protocol and remaining follow-up for JevGuard-NSFA. It expands the original JevGuard vs SingGuard validation to larger sample sizes and additional typed-decision engines without treating unlike runtime boundaries as interchangeable.
 
 ## Engines
 
@@ -217,7 +217,7 @@ Use:
 
 ## Current status
 
-This PR adds the reusable benchmark adapters, larger/full-dataset selection, N-way matrix comparator, calibration metrics, and unit tests. The first full-set round has now executed on this machine:
+This PR adds the reusable benchmark adapters, larger/full-dataset selection, N-way matrix comparator, calibration metrics, and unit tests. The author reports the following full-set runs. The seven original JSON artifacts are not included in this PR; zero-failure, fingerprint/alignment and performance claims remain pending independent verification. Decider-2b was run on cross-source-query only, not query/response:
 
 - cross-source-query, full 3,435 rows: JevGuard, SingGuard and Decider-2b all zero-failure with matching fingerprints and successful-sample digests, so quality and latency deltas are both comparable;
 - query, full 63,431 rows, and response, full 29,972 rows: both engines zero-failure and fully paired, so the comparator reports deltas for both;
@@ -225,3 +225,28 @@ This PR adds the reusable benchmark adapters, larger/full-dataset selection, N-w
 - Decider-2b: served locally from the pinned `Mapika/decider-2b` snapshot through `POST /v1/systemone`, so the `systemone-http` adapter now has real-runtime evidence instead of only fake-runtime tests.
 
 Concrete numbers, alignment output and the remaining gaps are in [BENCHMARK_VALIDATION.md](BENCHMARK_VALIDATION.md). Kev, Laya and Qwen-2.5-1B-RLCD still have no pinned runtime on this machine, so no accuracy numbers are claimed for them. The 100-row JevGuard/SingGuard measurements remain historical validation evidence.
+
+
+## Workflow and deadline semantics
+
+The manual Jev workflow allocates 120 minutes for full runs (110-minute benchmark step),
+otherwise 60 minutes (50-minute step). It passes a 6,000/2,400-second no-retry pacing
+budget to `bench-jev`. After selecting the actual dataset rows, the runner rejects
+impossible schedules before constructing the API client. This is a necessary-condition
+check, not a guarantee against slow inference, retries, dataset downloads or setup time.
+The remaining time is reserved for long tails, report validation and upload; a cancelled
+job can still lose an unfinished report because checkpoint/resume is not implemented.
+Full runs explicitly use `--timeout 180 --row-budget 600 --retries 2`, matching the
+reported full-set protocol. Smaller runs retain the 15-second/no-retry defaults.
+
+`--row-budget` starts after initial RPM admission. It includes the first attempt,
+all retry attempts, backoff and retry RPM waits, but excludes the initial semaphore/RPM
+queue. Each attempt's HTTP timeout is clamped to the remaining budget after admission.
+An outer cooperative asyncio deadline cancels an expired request or limiter wait.
+External cancellation propagates; operational errors never become safe verdicts.
+
+Open-engine warmup failures follow `--fail-fast` and are recorded separately in
+`warmup`, outside measured sample counts, fingerprints, quality and latency. Model
+initialization failures still abort. A valid JSON report is not sufficient for publishing
+zero-failure results: the workflow also requires zero failed measured rows and treats
+missing artifacts as errors.

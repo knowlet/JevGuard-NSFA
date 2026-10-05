@@ -44,7 +44,7 @@ permissions:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.full && 120 || 60 }}
     env:
       TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
       TYPESAFE_BASE_URL: ${{ vars.TYPESAFE_BASE_URL || 'https://api.typesafe.ai' }}
@@ -59,23 +59,50 @@ jobs:
       - name: Require TypeSafe credential
         run: test -n "$TYPESAFE_API_KEY"
       - name: Run benchmark
+        # Leave room for validation/upload even if the benchmark step times out.
+        timeout-minutes: ${{ inputs.full && 110 || 50 }}
+        env:
+          BENCHMARK: ${{ inputs.benchmark }}
+          FULL: ${{ inputs.full }}
+          LIMIT: ${{ inputs.limit }}
+          DATASET_REVISION: ${{ inputs.dataset_revision }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          RPM: ${{ inputs.rpm }}
+          MODEL: ${{ inputs.model }}
         run: |
-          limit_args=(--limit "${{ inputs.limit }}")
-          if [ "${{ inputs.full }}" = "true" ]; then
+          limit_args=(--limit "$LIMIT")
+          retry_args=(--timeout 15 --retries 0)
+          pacing_budget=2400
+          if [ "$FULL" = "true" ]; then
             limit_args=(--full)
+            retry_args=(--timeout 180 --row-budget 600 --retries 2)
+            pacing_budget=6000
           fi
           jevguard-nsfa bench-jev \
-            --benchmark "${{ inputs.benchmark }}" \
-            --dataset-revision "${{ inputs.dataset_revision }}" \
+            --benchmark "$BENCHMARK" \
+            --dataset-revision "$DATASET_REVISION" \
             "${limit_args[@]}" \
-            --concurrency "${{ inputs.concurrency }}" \
-            --rpm "${{ inputs.rpm }}" \
-            --model "${{ inputs.model }}" \
+            "${retry_args[@]}" \
+            --pacing-budget-seconds "$pacing_budget" \
+            --concurrency "$CONCURRENCY" \
+            --rpm "$RPM" \
+            --model "$MODEL" \
             --output benchmark-results/jevguard.json
+      - name: Validate benchmark report
+        run: |
+          python scripts/validate_benchmark_results.py \
+            --report benchmark-results/jevguard.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("benchmark-results/jevguard.json").read_text())
+          if report["samples"]["failed"] != 0:
+              raise SystemExit("Benchmark contains failed rows; not a zero-failure result")
+          PY
       - name: Upload benchmark report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jevguard-nsfa-${{ inputs.benchmark }}-${{ github.run_id }}
-          path: benchmark-results/
-          if-no-files-found: warn
+          path: benchmark-results/jevguard.json
+          if-no-files-found: error

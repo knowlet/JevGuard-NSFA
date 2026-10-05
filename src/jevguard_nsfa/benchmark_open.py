@@ -379,9 +379,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     successful_rows: list[BenchmarkRow] = []
     results: list[GuardResult] = []
 
+    warmup_rows = rows[: args.warmup]
+    warmup_failures: list[dict[str, Any]] = []
     try:
-        for row in rows[: args.warmup]:
-            backend.screen(row, policy)
+        for row in warmup_rows:
+            try:
+                backend.screen(row, policy)
+            except Exception as exc:
+                warmup_failures.append({"id": row.id, "error": f"{type(exc).__name__}: {exc}"})
+                if args.fail_fast:
+                    raise
 
         started = perf_counter()
         for row in rows:
@@ -447,6 +454,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "failed": len(failures),
             "attempted_ids_sha256": _rows_id_digest(rows),
             "successful_sha256": _rows_fingerprint(successful_rows),
+        },
+        "warmup": {
+            "requested": args.warmup,
+            "attempted": len(warmup_rows),
+            "successful": len(warmup_rows) - len(warmup_failures),
+            "failed": len(warmup_failures),
+            "failures": warmup_failures[:100],
+            "failure_records_truncated": len(warmup_failures) > 100,
         },
         "latency_scope": "request",
         "quality": quality,

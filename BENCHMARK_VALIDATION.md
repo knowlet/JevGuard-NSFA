@@ -125,9 +125,15 @@ PYTHONPATH=src .venv/bin/python scripts/validate_benchmark_results.py \
 - SingGuard 成本使用 $1.50/GPU-hour 情境假設；JevGuard cost 使用報告中的 API input price，不包含所有可能的服務費用。
 
 
-## Full-set benchmark round (2026-09-21)
+## Full-set benchmark round (2026-09-21; author-reported)
 
-第二輪把樣本數拉到完整資料集：query 63,431、response 29,972、cross-source-query 3,435，三個 subset 都在固定 dataset revision `54b390c5b9c26ec40ce7f660e278d909f4dad8dc` 上執行。上方 100 筆的結果保留為歷史驗證，這一輪才是目前的主要結論。
+> **Evidence status / 證據狀態：待獨立複核。** 下列為作者回報的執行結果，不是本 PR 已提供可獨立核驗的 artifacts。七份原始 JSON 位於被 gitignore 排除的 `benchmark-results/`，未隨本 PR 提供；因此零失敗、fingerprint／alignment 與效能結論都仍待最終 artifact 複核。範圍是 JevGuard／SingGuard 各三個 subset，加上 Decider-2b 的 cross-source-query，並非 Decider 的三個 subset 都已完成。
+
+要升級為可核驗結果，須發布這七份 JSON、各檔 SHA-256、source commit、完整執行參數、runtime／model／dataset revision 及硬體紀錄，再重跑下列 validator 與 comparison。Validator 可從 confusion matrix 重算分類指標，但 calibration 指標目前僅做數值／值域檢查；重新計算 Brier／log loss／ECE 仍需逐筆 label／probability。
+
+**Rounding rule:** comparison deltas are computed from unrounded JSON values; operands and deltas are rounded independently for display. Subtracting displayed four-decimal operands can differ by one unit in the last digit. The historical table has not been regenerated without its raw reports; its numerical claims remain pending artifact verification. Do not replace its deltas with differences of already-rounded operands.
+
+第二輪把樣本數拉到完整資料集：query 63,431、response 29,972、cross-source-query 3,435，三個 subset 都在固定 dataset revision `54b390c5b9c26ec40ce7f660e278d909f4dad8dc` 上執行。上方 100 筆的結果保留為歷史驗證；這一輪是作者回報的主要結果，獨立結論須等原始 artifacts 複核後才能確認。
 
 ### Protocol
 
@@ -220,9 +226,9 @@ Decider-2b 的 adapter 先前只有 fake-runtime unit test；這一輪讓它在�
 
 這符合它的定位。Decider-2b 是通用 typed-decision 模型，沒有針對 NSFA taxonomy 訓練，介面是每個問題一個 noul 布林值。分項上資源濫用 F1 為 0（2 個正例全部漏判），敏感資訊竊取 recall 只有 0.252，prompt injection 的 precision 0.517、recall 0.778 是相對較好的項目。它的吞吐約 1.58 req/s，因為容器內沒有 flash-linear-attention，linear-attention 層走 torch reference 路徑，latency 因此在不同的部署邊界上。
 
-### 驗證
+### 作者回報的驗證（待原始 artifacts 獨立複核）
 
-- 七份納入結果表的報告都通過 `scripts/validate_benchmark_results.py`：TP/FP/TN/FN 可重新推導 accuracy、precision、recall、F1 並與 JSON 一致；confusion matrix 總和等於 successful；attempted = successful + failed。
+- 作者回報七份納入結果表的報告都通過 `scripts/validate_benchmark_results.py`：TP/FP/TN/FN 可重新推導 accuracy、precision、recall、F1 並與 JSON 一致；confusion matrix 總和等於 successful；attempted = successful + failed。
 - SingGuard 三份報告的 `head_manifest.complete` 與 `baseline_complete` 都是 true，`model_revision.resolved` 等於 `455a72e4331b9ef37ae49154eff2a3715642c17a`。
 - query、response、cross-source-query 三組的 JevGuard 與 SingGuard 報告 `dataset.fingerprint` 與 `samples.successful_sha256` 都相同，`matrix` 對三組都輸出 quality comparable = true、latency comparable = true；cross-source 另含 Decider-2b。
 - cross-source 的早期重跑：timeout 30 與 timeout 60 各出現 1 筆 timeout；改成每列 180 秒並加上 `--row-budget 600` 後是 3,435/3,435。

@@ -360,6 +360,7 @@ def render_markdown(jev: dict[str, Any], singguard: dict[str, Any]) -> str:
         "",
         "## Method notes",
         "",
+        "- Deltas use unrounded report values; operands and deltas are rounded independently for display.",
         f"- Jev engine: {jev.get('model', 'unknown')} / mode {jev.get('mode', 'unknown')}.",
         f"- SingGuard engine: {singguard.get('model', 'unknown')} / mode {singguard.get('mode', 'unknown')}.",
         "- Compare quality only when both runs used the same dataset subset, sample order/seed, side, and threshold.",
