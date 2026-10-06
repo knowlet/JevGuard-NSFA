@@ -12,14 +12,19 @@ Operational failures stay failures: a row whose attempts are exhausted is record
 never reinterpreted as a safe verdict and never turned into a System-Two fallback (see guard.py).
 ``samples.request_attempts`` and ``samples.retried_requests`` count the measured rows only, and a
 row holds its ``--concurrency`` slot across its attempts, so concurrency keeps bounding in-flight
-rows while the attempt budget bounds how long one row can hold a slot.
+rows. The attempt budget starts after initial RPM admission and bounds the attempt sequence,
+including subsequent backoff and limiter waits; initial semaphore/RPM queueing is excluded
+from both the row budget and the reported logical-request latency. Cancellation is cooperative.
 
-``--timeout`` is the per-request HTTP timeout handed to the SDK and is also used as the total
-budget for one row's attempt sequence: a retry is not started when its wait would push the row past
-that budget, so a row cannot outlive the deadline the operator configured. The per-attempt wait is
-``Retry-After`` when the failure carries it, otherwise exponential backoff from 0.5s with jitter,
-capped at the local ``_RETRY_BACKOFF_CAP_SECONDS``. A server-provided ``Retry-After`` value is
-kept as requested; the total row budget decides whether another attempt can begin.
+``--timeout`` is the per-request HTTP timeout handed to the SDK. ``--row-budget`` is the total
+budget for one row's attempt sequence and defaults to ``--timeout``: with that default one
+timed-out attempt spends the whole budget and the row fails without a retry, so a full-corpus run
+that has to survive a rare transport hang sets ``--row-budget`` above ``--timeout``. A retry is not
+started when its wait would push the row past that budget, so a row cannot outlive the deadline the
+operator configured. The per-attempt wait is ``Retry-After`` when the failure carries it, otherwise
+exponential backoff from 0.5s with jitter, capped at the local ``_RETRY_BACKOFF_CAP_SECONDS``.
+A server-provided ``Retry-After`` value is kept as requested; the total row budget decides whether
+another attempt can begin.
 """
 
 from __future__ import annotations
@@ -167,8 +172,8 @@ class RequestStartLimiter:
     """Simple request-start limiter to stay below a provider RPM ceiling."""
 
     def __init__(self, rpm: float) -> None:
-        if rpm <= 0:
-            raise ValueError("rpm must be positive")
+        if not math.isfinite(rpm) or rpm <= 0:
+            raise ValueError("rpm must be finite and positive")
         self.interval = 60.0 / rpm
         self._lock = asyncio.Lock()
         self._next = 0.0
@@ -190,45 +195,66 @@ async def _screen_with_attempts(
     limiter: RequestStartLimiter,
     *,
     retries: int,
+    timeout: float | None,
     budget: float | None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     clock: Callable[[], float] | None = None,
 ) -> tuple[GuardResult | None, str | None, int]:
-    """Screen one row, retrying only what the SDK itself would retry.
+    """Screen a row under one deadline, including retry backoff and RPM waits.
 
-    With ``RetryPolicy(max_retries=0)`` each ``guard.screen`` call is exactly one real HTTP
-    attempt, so the limiter is acquired immediately before every attempt and the provider sees the
-    true request rate. A failure is reported as a failure; it is never converted into a verdict.
+    Initial admission (including the caller's semaphore wait) is deliberately outside
+    the logical-request latency/budget, as before. Every actual HTTP attempt still
+    requires a limiter slot. The SDK owns no retries. Cancellation is cooperative;
+    external cancellation propagates instead of becoming a scored or failed row.
     """
     sleeper = sleep or _sleep
     now = clock or monotonic
-    started = 0.0
+    await limiter.acquire()
+    started = now()
+    deadline = None if budget is None else started + budget
     attempts = 0
-    while True:
-        await limiter.acquire()
-        if attempts == 0:
-            # Start the logical-request clock immediately before the first attempt.
-            started = now()
-        attempts += 1
-        remaining = budget if budget is not None and attempts == 1 else None
-        if budget is not None and attempts > 1:
-            remaining = budget - (now() - started)
-            if remaining <= 0:
-                return None, "retry budget exhausted before attempt", attempts - 1
-        try:
-            if remaining is None:
-                result = await guard.screen(row.text, row.side)
-            else:
-                result = await guard.screen(row.text, row.side, timeout=remaining)
-            return replace(result, latency_ms=max(0.0, now() - started) * 1000.0), None, attempts
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            if attempts > retries or not _is_retryable(exc):
-                return None, error, attempts
-            delay = retry_wait_seconds(attempts, exc)
-            if budget is not None and now() - started + delay >= budget:
-                return None, error, attempts
-            await sleeper(delay)
+    row_timeout = asyncio.timeout(budget)
+    try:
+        async with row_timeout:
+            while True:
+                if attempts:
+                    # Do not reserve another slot if backoff already spent the budget.
+                    if deadline is not None and now() >= deadline:
+                        return None, "retry budget exhausted before attempt", attempts
+                    await limiter.acquire()
+                # Recompute AFTER admission: a retry may have waited behind other rows.
+                remaining = budget if attempts == 0 else (
+                    None if deadline is None else deadline - now()
+                )
+                if remaining is not None and remaining <= 0:
+                    return None, "retry budget exhausted before attempt", attempts
+                attempt_timeout = timeout
+                if remaining is not None:
+                    attempt_timeout = remaining if timeout is None else min(timeout, remaining)
+                attempts += 1
+                try:
+                    if attempt_timeout is None:
+                        result = await guard.screen(row.text, row.side)
+                    else:
+                        result = await guard.screen(row.text, row.side, timeout=attempt_timeout)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    if attempts > retries or not _is_retryable(exc):
+                        return None, error, attempts
+                    delay = retry_wait_seconds(attempts, exc)
+                    if deadline is not None and now() + delay >= deadline:
+                        return None, error, attempts
+                    await sleeper(delay)
+                else:
+                    elapsed = max(0.0, now() - started)
+                    # Also reject a late result from a backend that did not yield.
+                    if budget is not None and elapsed >= budget:
+                        return None, "row budget exhausted", attempts
+                    return replace(result, latency_ms=elapsed * 1000.0), None, attempts
+    except TimeoutError:
+        if not row_timeout.expired():
+            raise
+        return None, "row budget exhausted", attempts
 
 
 async def _run_one(
@@ -238,6 +264,7 @@ async def _run_one(
     limiter: RequestStartLimiter,
     *,
     retries: int = 0,
+    timeout: float | None = None,
     budget: float | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     clock: Callable[[], float] | None = None,
@@ -249,6 +276,7 @@ async def _run_one(
             guard,
             limiter,
             retries=retries,
+            timeout=timeout,
             budget=budget,
             sleep=sleep,
             clock=clock,
@@ -256,9 +284,36 @@ async def _run_one(
     return row, result, error, attempts
 
 
+def check_pacing_budget(
+    rows: int, warmup: int, rpm: float, budget_seconds: float | None,
+) -> float:
+    """Reject an impossible request-start schedule before any paid API request.
+
+    This is only the no-retry pacing lower bound, NOT a completion-time estimate.
+    The workflow reserves separate time for setup, long tails, validation and upload.
+    """
+    if not math.isfinite(rpm) or rpm <= 0:
+        raise ValueError("--rpm must be finite and positive")
+    if rows < 0 or warmup < 0:
+        raise ValueError("row and warmup counts must be non-negative")
+    minimum_seconds = max(0, rows + warmup - 1) * (60.0 / rpm)
+    if budget_seconds is not None:
+        if not math.isfinite(budget_seconds) or budget_seconds <= 0:
+            raise ValueError("--pacing-budget-seconds must be finite and positive")
+        if minimum_seconds >= budget_seconds:
+            raise ValueError(
+                f"request-start pacing alone needs at least {minimum_seconds:.2f}s "
+                f"for {rows} rows and {warmup} warmups at {rpm:g} RPM; "
+                f"available pacing budget is {budget_seconds:g}s"
+            )
+    return minimum_seconds
+
+
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     languages = set(args.language) if args.language else None
     dataset_revision = getattr(args, "dataset_revision", None)
+    full_dataset = bool(getattr(args, "full", False))
+    selected_limit = None if full_dataset else args.limit
     rows = list(
         iter_huggingface_rows(
             dataset_name=args.dataset,
@@ -266,7 +321,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             benchmark=args.benchmark,
             languages=languages,
             id_contains=args.id_contains,
-            limit=args.limit,
+            limit=selected_limit,
             seed=args.seed,
             revision=dataset_revision,
         )
@@ -274,13 +329,26 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("No benchmark rows matched the requested filters")
 
+    minimum_pacing_seconds = check_pacing_budget(
+        len(rows), min(args.warmup, len(rows)), args.rpm,
+        getattr(args, "pacing_budget_seconds", None),
+    )
+
     policy = ThresholdPolicy(default_threshold=args.threshold, review_margin=args.review_margin)
     limiter = RequestStartLimiter(args.rpm)
     semaphore = asyncio.Semaphore(args.concurrency)
     # SDK retries are disabled on purpose: this runner retries so that every real HTTP attempt is
     # acquired from the limiter and counted in samples.request_attempts.
     retry = RetryPolicy(max_retries=0)
-    retry_budget = float(args.timeout) if args.timeout and args.timeout > 0 else None
+    request_timeout = float(args.timeout) if args.timeout and args.timeout > 0 else None
+    row_budget = getattr(args, "row_budget", None)
+    # Default to the historical single-value deadline: one row may not outlive ``--timeout``
+    # unless the operator widens the retry window with ``--row-budget``.
+    retry_budget = (
+        request_timeout
+        if row_budget is None
+        else (float(row_budget) if row_budget and row_budget > 0 else None)
+    )
 
     warmup_tokens = 0
     async with AsyncTypeSafeClient(
@@ -299,7 +367,15 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         started = perf_counter()
         outcomes = await asyncio.gather(
             *(
-                _run_one(row, guard, semaphore, limiter, retries=args.retries, budget=retry_budget)
+                _run_one(
+                    row,
+                    guard,
+                    semaphore,
+                    limiter,
+                    retries=args.retries,
+                    timeout=request_timeout,
+                    budget=retry_budget,
+                )
                 for row in rows
             )
         )
@@ -344,6 +420,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": 1,
         "engine": "jevguard-nsfa",
         "mode": "managed-api-online",
+        "execution_plan": {
+            "minimum_pacing_seconds": minimum_pacing_seconds,
+            "pacing_budget_seconds": getattr(args, "pacing_budget_seconds", None),
+            "note": "No-retry request-start lower bound, including warmup; not a runtime estimate.",
+        },
         "model": results[0].model if results else args.model,
         "dataset": {
             "name": args.dataset,
@@ -362,9 +443,12 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "concurrency": args.concurrency,
             "rpm": args.rpm,
             "timeout_seconds": args.timeout,
+            "row_budget_seconds": retry_budget,
             "retries": args.retries,
             "warmup_requests": args.warmup,
             "input_price_usd_per_million": args.input_price_per_million,
+            "requested_limit": None if full_dataset else args.limit,
+            "full_dataset": full_dataset,
         },
         "samples": {
             "attempted": len(rows),
@@ -417,6 +501,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--language", action="append", help="Language code; repeat to include multiple languages")
     parser.add_argument("--id-contains", default=None, help="Optional substring filter for dataset row ids")
     parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--full", action="store_true", help="Ignore --limit and score the full selected benchmark subset")
     parser.add_argument("--seed", type=int, default=42)
     # Left unset so the SDK resolves the model as explicit value -> TYPESAFE_DEFAULT_MODEL -> SDK
     # default; a hardcoded default here would make the environment variable unreachable.
@@ -431,10 +516,23 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--rpm", type=float, default=900.0)
     parser.add_argument(
+        "--pacing-budget-seconds", type=float, default=None,
+        help="Reject impossible no-retry request-start schedules before API use; not a runtime timeout",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=15.0,
-        help="Per-request HTTP timeout in seconds; also the total attempt budget for one row",
+        help="Per-request HTTP timeout in seconds; the default total attempt budget for one row",
+    )
+    parser.add_argument(
+        "--row-budget",
+        type=float,
+        default=None,
+        help=(
+            "Seconds after initial RPM admission, including attempts, retry backoff and retry RPM waits; "
+            "defaults to --timeout, which means one timed-out attempt exhausts the budget"
+        ),
     )
     parser.add_argument(
         "--retries",
@@ -448,12 +546,21 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def main_from_args(args: argparse.Namespace) -> int:
-    if args.limit is not None and args.limit <= 0:
-        raise ValueError("--limit must be positive")
+    if not getattr(args, "full", False) and (args.limit is None or args.limit <= 0):
+        raise ValueError("--limit must be positive unless --full is set")
     if args.concurrency <= 0:
         raise ValueError("--concurrency must be positive")
     if args.retries < 0:
         raise ValueError("--retries must be non-negative")
+    if args.warmup < 0:
+        raise ValueError("--warmup must be non-negative")
+    if args.timeout is not None and not math.isfinite(args.timeout):
+        raise ValueError("--timeout must be finite")
+    if getattr(args, "row_budget", None) is not None and (
+        not math.isfinite(args.row_budget) or args.row_budget <= 0
+    ):
+        raise ValueError("--row-budget must be positive and finite when set")
+    check_pacing_budget(0, 0, args.rpm, getattr(args, "pacing_budget_seconds", None))
     report = asyncio.run(run_benchmark(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Undefined metrics are None, never NaN, so the artifact must stay strict JSON.

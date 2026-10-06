@@ -498,6 +498,8 @@ def _infer_batch(
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_side = Side.RESPONSE if args.benchmark == "response" else Side.QUERY
     dataset_revision = getattr(args, "dataset_revision", None)
+    full_dataset = bool(getattr(args, "full", False))
+    selected_limit = None if full_dataset else args.limit
     model_revision = getattr(args, "model_revision", None)
     allow_partial_heads = bool(getattr(args, "allow_partial_heads", False))
     languages = set(args.language) if args.language else None
@@ -509,7 +511,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             side=benchmark_side,
             languages=languages,
             id_contains=args.id_contains,
-            limit=args.limit,
+            limit=selected_limit,
             seed=args.seed,
             revision=dataset_revision,
         )
@@ -675,6 +677,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "dtype": args.dtype,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "gpu_hourly_usd": args.gpu_hourly_usd,
+            "requested_limit": None if full_dataset else args.limit,
+            "full_dataset": full_dataset,
         },
         "samples": {
             "attempted": len(rows),
@@ -754,6 +758,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--language", action="append")
     parser.add_argument("--id-contains", default=None)
     parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--full", action="store_true", help="Ignore --limit and score the full selected benchmark subset")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", default="inclusionAI/SingGuard-NSFA-0.8B")
     parser.add_argument(
@@ -785,8 +790,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def main_from_args(args: argparse.Namespace) -> int:
-    if args.limit is not None and args.limit <= 0:
-        raise ValueError("--limit must be positive")
+    if not getattr(args, "full", False) and (args.limit is None or args.limit <= 0):
+        raise ValueError("--limit must be positive unless --full is set")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
     report = run_benchmark(args)

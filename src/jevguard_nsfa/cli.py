@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--timeout", type=float, default=15.0)
     screen.set_defaults(handler=_screen)
 
-    from . import benchmark_jev, benchmark_singguard, compare
+    from . import benchmark_jev, benchmark_open, benchmark_singguard, compare, matrix
 
     bench_jev = sub.add_parser("bench-jev", help="Benchmark JevGuard on the public NSFA benchmark")
     benchmark_jev.add_arguments(bench_jev)
@@ -53,9 +53,20 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_singguard.add_arguments(bench_sing)
     bench_sing.set_defaults(handler=benchmark_singguard.main_from_args)
 
+    bench_open = sub.add_parser(
+        "bench-open",
+        help="Benchmark Kev, Laya, Decider, or RLCD on the public NSFA benchmark",
+    )
+    benchmark_open.add_arguments(bench_open)
+    bench_open.set_defaults(handler=benchmark_open.main_from_args)
+
     comp = sub.add_parser("compare", help="Render a side-by-side benchmark comparison")
     compare.add_arguments(comp)
     comp.set_defaults(handler=compare.main_from_args)
+
+    matrix_parser = sub.add_parser("matrix", help="Render an N-way benchmark comparison matrix")
+    matrix.add_arguments(matrix_parser)
+    matrix_parser.set_defaults(handler=matrix.main_from_args)
 
     return parser
 

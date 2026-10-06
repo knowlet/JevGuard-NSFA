@@ -20,6 +20,8 @@ class BinaryMetrics:
     false_positive_rate: float
     false_negative_rate: float
     brier: float
+    log_loss: float
+    expected_calibration_error: float
     tp: int
     fp: int
     tn: int
@@ -41,6 +43,8 @@ def binary_metrics(labels: Sequence[int], predicted: Sequence[bool], probabiliti
 
     tp = fp = tn = fn = 0
     brier_sum = 0.0
+    log_loss_sum = 0.0
+    calibration_bins: list[list[tuple[float, int]]] = [[] for _ in range(10)]
     for truth, guess, probability in zip(labels, predicted, probabilities, strict=True):
         if truth not in (0, 1):
             raise ValueError("labels must be binary")
@@ -52,7 +56,22 @@ def binary_metrics(labels: Sequence[int], predicted: Sequence[bool], probabiliti
             tn += 1
         else:
             fn += 1
-        brier_sum += (float(probability) - truth) ** 2
+        probability = float(probability)
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("probabilities must be in [0, 1]")
+        brier_sum += (probability - truth) ** 2
+        clipped = min(max(probability, 1e-15), 1.0 - 1e-15)
+        log_loss_sum -= truth * math.log(clipped) + (1 - truth) * math.log(1.0 - clipped)
+        bin_index = min(int(probability * 10), 9)
+        calibration_bins[bin_index].append((probability, truth))
+
+    ece = 0.0
+    for bucket in calibration_bins:
+        if not bucket:
+            continue
+        mean_probability = sum(probability for probability, _ in bucket) / len(bucket)
+        empirical_rate = sum(truth for _, truth in bucket) / len(bucket)
+        ece += len(bucket) / len(labels) * abs(mean_probability - empirical_rate)
 
     precision = _safe_div(tp, tp + fp)
     recall = _safe_div(tp, tp + fn)
@@ -64,6 +83,8 @@ def binary_metrics(labels: Sequence[int], predicted: Sequence[bool], probabiliti
         false_positive_rate=_safe_div(fp, fp + tn),
         false_negative_rate=_safe_div(fn, fn + tp),
         brier=brier_sum / len(labels),
+        log_loss=log_loss_sum / len(labels),
+        expected_calibration_error=ece,
         tp=tp,
         fp=fp,
         tn=tn,

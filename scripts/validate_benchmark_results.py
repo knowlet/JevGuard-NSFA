@@ -9,13 +9,20 @@ from pathlib import Path
 from typing import Any
 
 
+def _finite_number(value: Any) -> float | None:
+    """A JSON number, excluding booleans, that fits in a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _close(actual: float, reported: Any) -> bool:
-    return isinstance(reported, (int, float)) and math.isclose(
-        actual,
-        float(reported),
-        rel_tol=1e-10,
-        abs_tol=1e-12,
-    )
+    number = _finite_number(reported)
+    return number is not None and math.isclose(actual, number, rel_tol=1e-10, abs_tol=1e-12)
 
 
 def validate_report(path: Path) -> dict[str, Any]:
@@ -73,6 +80,16 @@ def validate_report(path: Path) -> dict[str, Any]:
             ):
                 if not _close(actual, binary.get(name)):
                     errors.append(f"quality.binary.{name} does not match TP/FP/TN/FN")
+
+            for name in ("brier", "log_loss"):
+                value = binary.get(name)
+                number = _finite_number(value)
+                if value is not None and (number is None or number < 0):
+                    errors.append(f"quality.binary.{name} must be a finite non-negative number")
+            ece = binary.get("expected_calibration_error")
+            number = _finite_number(ece)
+            if ece is not None and (number is None or not 0.0 <= number <= 1.0):
+                errors.append("quality.binary.expected_calibration_error must be in [0, 1]")
 
     if data.get("engine") == "singguard-nsfa":
         manifest = data.get("head_manifest")
