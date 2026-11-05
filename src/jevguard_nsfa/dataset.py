@@ -114,9 +114,17 @@ def infer_side(row: dict[str, Any], forced: Side | None = None) -> Side:
 
 
 def row_from_mapping(row: dict[str, Any], forced_side: Side | None = None) -> BenchmarkRow:
-    label = int(row["label"])
-    if label not in (0, 1):
-        raise ValueError(f"Expected binary label 0/1, got {label!r}")
+    raw_label = row["label"]
+    try:
+        label = int(raw_label)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Expected binary label 0/1, got {raw_label!r}") from exc
+    # int() truncates fractional numbers. Keep exact numeric 0/1 and the
+    # supported integer-text forms without silently changing the ground truth.
+    if label not in (0, 1) or (
+        not isinstance(raw_label, (str, bytes, bytearray)) and raw_label != label
+    ):
+        raise ValueError(f"Expected binary label 0/1, got {raw_label!r}")
     domains = canonical_domains(row.get("L1-Risk") or row.get("l1_risk") or row.get("domain"))
     return BenchmarkRow(
         id=str(row.get("id", "")),

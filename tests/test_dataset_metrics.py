@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
@@ -37,6 +39,25 @@ def test_multi_label_ground_truth_is_preserved() -> None:
 
 def test_no_risk_has_no_domain() -> None:
     assert canonical_domains("No_Risk") == ()
+
+
+@pytest.mark.parametrize("label", [-0.5, 0.5, 1.5, Decimal("0.9"), Fraction(1, 2)])
+def test_fractional_labels_are_rejected_without_truncation(label: object) -> None:
+    with pytest.raises(ValueError, match="Expected binary label 0/1"):
+        row_from_mapping({"text": "example", "label": label}, forced_side=Side.QUERY)
+
+
+@pytest.mark.parametrize("label", [None, float("nan"), float("inf"), float("-inf"), "invalid", 2, -1])
+def test_invalid_labels_raise_a_consistent_validation_error(label: object) -> None:
+    with pytest.raises(ValueError, match="Expected binary label 0/1"):
+        row_from_mapping({"text": "example", "label": label}, forced_side=Side.QUERY)
+
+
+@pytest.mark.parametrize("label", [0, 1, 0.0, 1.0, "0", "1", " 1 ", "+0", Decimal("1"), Fraction(0, 1)])
+def test_exact_binary_labels_remain_supported(label: object) -> None:
+    row = row_from_mapping({"text": "example", "label": label}, forced_side=Side.QUERY)
+    assert row.label == int(label)
+    assert type(row.label) is int
 
 
 def test_official_response_domain_aliases_are_canonicalized() -> None:
