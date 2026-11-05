@@ -343,3 +343,46 @@ def _as_benchmark_row(row: dict[str, Any]) -> Any:
         domains=tuple(row["domains"]),
         lang=row["lang"],
     )
+
+
+
+@pytest.mark.parametrize("side", [0, 1])
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf"), 10**400, None, True, "0.9"],
+    ids=["nan", "infinity", "negative-infinity", "oversized-integer", "null", "boolean", "numeric-text"],
+)
+def test_compare_withholds_nonfinite_or_nonnumeric_metric(side: int, value: Any) -> None:
+    reports = _pair()
+    reports[side]["quality"]["binary"]["f1"] = value
+    cells = _row_cells(render_markdown(*reports), "Binary F1")
+    assert cells[side + 1] == "n/a"
+    assert cells[3] == "n/a"
+    assert cells[2 if side == 0 else 1] == ("0.4000" if side == 0 else "0.9000")
+
+
+def test_compare_withholds_overflowed_delta() -> None:
+    jev, sing = _pair()
+    jev["latency_ms"]["p50"] = 1e308
+    sing["latency_ms"]["p50"] = -1e308
+    cells = _row_cells(render_markdown(jev, sing), "Latency p50 (ms)")
+    assert cells[1] != "n/a"
+    assert cells[2] != "n/a"
+    assert cells[3] == "n/a"
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity", "1e309", "1" + "0" * 400])
+def test_compare_cli_handles_nonfinite_json_metric(tmp_path, capsys, token: str) -> None:
+    from jevguard_nsfa.compare import main_from_args
+
+    jev, sing = _pair()
+    jev["quality"]["binary"]["f1"] = "BAD_METRIC"
+    jev_path = tmp_path / "jev.json"
+    sing_path = tmp_path / "sing.json"
+    output_path = tmp_path / "comparison.md"
+    jev_path.write_text(json.dumps(jev).replace('"BAD_METRIC"', token), encoding="utf-8")
+    sing_path.write_text(json.dumps(sing), encoding="utf-8")
+    assert main_from_args(argparse.Namespace(jev=jev_path, singguard=sing_path, output=output_path)) == 0
+    markdown = output_path.read_text(encoding="utf-8")
+    assert _row_cells(markdown, "Binary F1") == ["Binary F1", "n/a", "0.4000", "n/a"]
+    assert markdown in capsys.readouterr().out

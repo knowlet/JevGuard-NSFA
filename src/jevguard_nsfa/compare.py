@@ -44,15 +44,24 @@ def _raw(data: dict[str, Any], path: str) -> Any:
     return value
 
 
+def _finite_number(value: Any) -> float | int | None:
+    """Keep only numbers that can participate in finite floating-point deltas."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        # JSON integers are unbounded, unlike the floats used for deltas.
+        return None
+
+
 def _get(data: dict[str, Any], path: str) -> float | int | None:
-    value = _raw(data, path)
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return _finite_number(_raw(data, path))
 
 
 def _fmt(value: float | int | None, digits: int = 4) -> str:
+    value = _finite_number(value)
     if value is None:
-        return "n/a"
-    if isinstance(value, float) and math.isnan(value):
         return "n/a"
     if isinstance(value, int):
         return str(value)
@@ -361,6 +370,7 @@ def render_markdown(jev: dict[str, Any], singguard: dict[str, Any]) -> str:
         "## Method notes",
         "",
         "- Deltas use unrounded report values; operands and deltas are rounded independently for display.",
+        "- Non-finite, nonnumeric, or oversized metric values and non-finite deltas are rendered n/a.",
         f"- Jev engine: {jev.get('model', 'unknown')} / mode {jev.get('mode', 'unknown')}.",
         f"- SingGuard engine: {singguard.get('model', 'unknown')} / mode {singguard.get('mode', 'unknown')}.",
         "- Compare quality only when both runs used the same dataset subset, sample order/seed, side, and threshold.",
