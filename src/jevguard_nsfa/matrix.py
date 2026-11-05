@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,11 @@ def _fmt(value: Any, digits: int) -> str:
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, (int, float)):
+        try:
+            if not math.isfinite(value):
+                return "n/a"
+        except OverflowError:
+            return "n/a"
         return f"{value:.{digits}f}" if digits else str(int(value))
     return str(value)
 
@@ -155,6 +161,7 @@ def render_markdown(reports: dict[str, dict[str, Any]]) -> str:
         "",
         "## Interpretation",
         "",
+        "- Non-finite numeric metrics and integers outside the float range are shown as n/a; alignment checks do not validate metric values.",
         "- Quality values should only be compared when quality_comparable is true.",
         "- Latency values should only be compared when latency_comparable is true.",
         "- Throughput is shown as reported but may represent sequential requests, batching, or a load test; read each report's mode/notes before treating it as a capacity comparison.",

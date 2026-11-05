@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from jevguard_nsfa.matrix import alignment, render_markdown
 
 
@@ -80,3 +82,39 @@ def test_successful_subset_mismatch_withholds_quality() -> None:
     assert result["quality_comparable"] is False
     assert result["checks"]["samples.successful"] is False
     assert result["checks"]["samples.successful_sha256"] is False
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 10**400])
+@pytest.mark.parametrize("section,key,row", [
+    ("latency_ms", "p50", "Latency p50 (ms)"),
+    ("samples", "failed", "Failed"),
+])
+def test_invalid_numeric_metrics_render_as_unavailable(value, section, key, row) -> None:
+    report = _report()
+    report[section][key] = value
+    rendered = render_markdown({"invalid": report, "control": _report()})
+    expected = "10.00" if section == "latency_ms" else "0"
+    assert f"| {row} | n/a | {expected} |" in rendered
+    assert "| F1 | 0.8000 | 0.8000 |" in rendered
+
+
+def test_matrix_cli_handles_json_numeric_overflow(tmp_path, capsys) -> None:
+    import argparse
+    import json
+
+    from jevguard_nsfa.matrix import main_from_args
+
+    report = _report()
+    source = tmp_path / "report.json"
+    source.write_text(json.dumps(report).replace('"failed": 0', '"failed": 1e309'))
+    output = tmp_path / "nested" / "matrix.md"
+    assert main_from_args(argparse.Namespace(report=[("test", source)], output=output)) == 0
+    assert "| Failed | n/a |" in output.read_text()
+    assert output.read_text().strip() == capsys.readouterr().out.strip()
+
+
+@pytest.mark.parametrize("value,expected", [(0, "0"), (3, "3"), (3.0, "3"), (3.9, "3")])
+def test_finite_count_format_is_preserved(value, expected) -> None:
+    report = _report()
+    report["samples"]["failed"] = value
+    assert f"| Failed | {expected} |" in render_markdown({"test": report})
