@@ -25,10 +25,19 @@ def _close(actual: float, reported: Any) -> bool:
     return number is not None and math.isclose(actual, number, rel_tol=1e-10, abs_tol=1e-12)
 
 
+def _object(value: Any, field: str, errors: list[str]) -> dict[str, Any]:
+    """Record invalid JSON object shapes before accessing their fields."""
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be a JSON object")
+        return {}
+    return value
+
+
 def validate_report(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     errors: list[str] = []
-    samples = data.get("samples", {})
+    data = _object(data, "report", errors)
+    samples = _object(data.get("samples", {}), "samples", errors)
     attempted = samples.get("attempted")
     successful = samples.get("successful")
     failed = samples.get("failed")
@@ -40,7 +49,7 @@ def validate_report(path: Path) -> dict[str, Any]:
             f"successful={successful}, failed={failed}"
         )
 
-    dataset = data.get("dataset", {})
+    dataset = _object(data.get("dataset", {}), "dataset", errors)
     fingerprint = dataset.get("fingerprint")
     successful_digest = samples.get("successful_sha256")
     if not isinstance(fingerprint, str) or len(fingerprint) != 64:
@@ -97,7 +106,8 @@ def validate_report(path: Path) -> dict[str, Any]:
             errors.append("SingGuard head_manifest.complete is not true")
         if data.get("baseline_complete") is not True:
             errors.append("SingGuard baseline_complete is not true")
-        revision = data.get("model_revision", {}).get("resolved")
+        model_revision = _object(data.get("model_revision", {}), "model_revision", errors)
+        revision = model_revision.get("resolved")
         if not isinstance(revision, str) or not revision:
             errors.append("SingGuard model_revision.resolved is missing")
 
