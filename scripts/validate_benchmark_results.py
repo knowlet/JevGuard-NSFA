@@ -65,10 +65,10 @@ def validate_report(path: Path) -> dict[str, Any]:
         errors.append("quality.binary is missing")
     else:
         try:
-            tp = int(binary["tp"])
-            tn = int(binary["tn"])
-            fp = int(binary["fp"])
-            fn = int(binary["fn"])
+            counts = [binary[name] for name in ("tp", "tn", "fp", "fn")]
+            if any(type(value) is not int or value < 0 for value in counts):
+                raise ValueError("counts must be non-negative JSON integers")
+            tp, tn, fp, fn = counts
             total = tp + tn + fp + fn
             precision = tp / (tp + fp) if tp + fp else 0.0
             recall = tp / (tp + fn) if tp + fn else 0.0
