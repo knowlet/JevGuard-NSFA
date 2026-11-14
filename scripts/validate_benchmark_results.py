@@ -41,8 +41,10 @@ def validate_report(path: Path) -> dict[str, Any]:
     attempted = samples.get("attempted")
     successful = samples.get("successful")
     failed = samples.get("failed")
-    if not all(isinstance(value, int) for value in (attempted, successful, failed)):
+    if not all(type(value) is int for value in (attempted, successful, failed)):
         errors.append("samples.attempted/successful/failed must be integers")
+    elif any(value < 0 for value in (attempted, successful, failed)):
+        errors.append("samples.attempted/successful/failed must be non-negative")
     elif attempted != successful + failed:
         errors.append(
             f"sample accounting mismatch: attempted={attempted}, "
