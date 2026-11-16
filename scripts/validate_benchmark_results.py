@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+from string import hexdigits
 from typing import Any
 
 
@@ -54,9 +55,10 @@ def validate_report(path: Path) -> dict[str, Any]:
     dataset = _object(data.get("dataset", {}), "dataset", errors)
     fingerprint = dataset.get("fingerprint")
     successful_digest = samples.get("successful_sha256")
-    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64 or any(c not in hexdigits for c in fingerprint):
         errors.append("dataset.fingerprint is not a SHA-256 hex digest")
-    if not isinstance(successful_digest, str) or len(successful_digest) != 64:
+    if (not isinstance(successful_digest, str) or len(successful_digest) != 64
+            or any(c not in hexdigits for c in successful_digest)):
         errors.append("samples.successful_sha256 is not a SHA-256 hex digest")
     if failed == 0 and fingerprint != successful_digest:
         errors.append("dataset.fingerprint differs from samples.successful_sha256")
