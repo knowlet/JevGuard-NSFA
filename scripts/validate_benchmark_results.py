@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+from string import hexdigits
 from typing import Any
 
 
@@ -25,27 +26,39 @@ def _close(actual: float, reported: Any) -> bool:
     return number is not None and math.isclose(actual, number, rel_tol=1e-10, abs_tol=1e-12)
 
 
+def _object(value: Any, field: str, errors: list[str]) -> dict[str, Any]:
+    """Record invalid JSON object shapes before accessing their fields."""
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be a JSON object")
+        return {}
+    return value
+
+
 def validate_report(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     errors: list[str] = []
-    samples = data.get("samples", {})
+    data = _object(data, "report", errors)
+    samples = _object(data.get("samples", {}), "samples", errors)
     attempted = samples.get("attempted")
     successful = samples.get("successful")
     failed = samples.get("failed")
-    if not all(isinstance(value, int) for value in (attempted, successful, failed)):
+    if not all(type(value) is int for value in (attempted, successful, failed)):
         errors.append("samples.attempted/successful/failed must be integers")
+    elif any(value < 0 for value in (attempted, successful, failed)):
+        errors.append("samples.attempted/successful/failed must be non-negative")
     elif attempted != successful + failed:
         errors.append(
             f"sample accounting mismatch: attempted={attempted}, "
             f"successful={successful}, failed={failed}"
         )
 
-    dataset = data.get("dataset", {})
+    dataset = _object(data.get("dataset", {}), "dataset", errors)
     fingerprint = dataset.get("fingerprint")
     successful_digest = samples.get("successful_sha256")
-    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64 or any(c not in hexdigits for c in fingerprint):
         errors.append("dataset.fingerprint is not a SHA-256 hex digest")
-    if not isinstance(successful_digest, str) or len(successful_digest) != 64:
+    if (not isinstance(successful_digest, str) or len(successful_digest) != 64
+            or any(c not in hexdigits for c in successful_digest)):
         errors.append("samples.successful_sha256 is not a SHA-256 hex digest")
     if failed == 0 and fingerprint != successful_digest:
         errors.append("dataset.fingerprint differs from samples.successful_sha256")
@@ -56,10 +69,10 @@ def validate_report(path: Path) -> dict[str, Any]:
         errors.append("quality.binary is missing")
     else:
         try:
-            tp = int(binary["tp"])
-            tn = int(binary["tn"])
-            fp = int(binary["fp"])
-            fn = int(binary["fn"])
+            counts = [binary[name] for name in ("tp", "tn", "fp", "fn")]
+            if any(type(value) is not int or value < 0 for value in counts):
+                raise ValueError("counts must be non-negative JSON integers")
+            tp, tn, fp, fn = counts
             total = tp + tn + fp + fn
             precision = tp / (tp + fp) if tp + fp else 0.0
             recall = tp / (tp + fn) if tp + fn else 0.0
@@ -97,7 +110,8 @@ def validate_report(path: Path) -> dict[str, Any]:
             errors.append("SingGuard head_manifest.complete is not true")
         if data.get("baseline_complete") is not True:
             errors.append("SingGuard baseline_complete is not true")
-        revision = data.get("model_revision", {}).get("resolved")
+        model_revision = _object(data.get("model_revision", {}), "model_revision", errors)
+        revision = model_revision.get("resolved")
         if not isinstance(revision, str) or not revision:
             errors.append("SingGuard model_revision.resolved is missing")
 
